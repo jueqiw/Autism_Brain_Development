@@ -44,18 +44,18 @@ def get_train_data_transform() -> Compose:
                 keys=["img", "mask"],
                 spatial_size=[196, 196, 196],
             ),
-            ScaleIntensityRangePercentilesd(
-                keys=[
-                    "img",
-                ],
-                lower=0.5,
-                upper=99.5,
-                b_min=0.0,
-                b_max=1.0,
-                clip=True,
-            ),
+            # ScaleIntensityRangePercentilesd(
+            #     keys=[
+            #         "img",
+            #     ],
+            #     lower=0.5,
+            #     upper=99.5,
+            #     b_min=0.0,
+            #     b_max=1.0,
+            #     clip=True,
+            # ),
             ToTensord(
-                keys=["img", "label"],
+                keys=["img", "mask"],
             ),
         ]
     )
