@@ -14,7 +14,7 @@ from utils.transforms import get_train_data_transform
 
 
 def create_2D_image(path: Path) -> list:
-    imgs = ABIDE_I_MNI.glob(
+    imgs = ABIDE_II_MNI.glob(
         "**/sub-*_space-MNI152NLin2009cAsym_desc-preproc_T1w.nii.gz"
     )
 
@@ -32,10 +32,7 @@ def create_2D_image(path: Path) -> list:
 
 if __name__ == "__main__":
     dataset_name = "II"
-    if dataset_name == "I":
-        sample_dicts = create_2D_image(ABIDE_I_MNI)
-    elif dataset_name == "II":
-        sample_dicts = create_2D_image(ABIDE_II_MNI)
+    sample_dicts = create_2D_image(ABIDE_II_MNI)
 
     train_transform = get_train_data_transform()
     train_ds = Dataset(data=sample_dicts, transform=train_transform)
