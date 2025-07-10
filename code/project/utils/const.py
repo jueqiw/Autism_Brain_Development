@@ -1,79 +1,41 @@
 import os
 from pathlib import Path
 
-
-# ADNI data path
-if os.environ.get("HOME") == "/Users/a16446":
-    ACE_FILE = Path(
-        "/Users/a16446/Documents/GitHub/BrainGenePathway/data/ASD/final_ACE_KEGG_pathway_with_all_genes_img_4_features_p_threshold_0.1_effect_size_LD_50kb.csv"
-    )
-    ADNI_FILE = Path(
-        "/Users/a16446/Documents/GitHub/BrainGenePathway/data/ADNI/final_AD_KEGG_pathway_with_all_genes_img_p_threshold_0.1_effect_size_LD_50kb.csv"
-    )
-    CROSS_VAL_INDEX_ACE = Path(
-        "/Users/a16446/Documents/GitHub/BrainGenePathway/data/ASD/10_10_cross_fold_val_index.pkl"
-    )
-    CROSS_VAL_INDEX_ADNI = Path(
-        "/Users/a16446/Documents/GitHub/BrainGenePathway/data/ADNI/10_10_cross_fold_val_index.pkl"
-    )
-    RESULT_FOLDER = Path(
-        "/Users/a16446/Documents/GitHub/BrainGenePathway/results/results"
-    ).resolve()
-elif os.environ.get("HOME") == "/home/mnd2vy":
-    ACE_FILE = Path(
-        "/data/ics328/ivy-hip-ubdt/JueqiWang/data/ASD/final_ACE_KEGG_pathway_with_all_genes_img_4_features_p_threshold_0.1_effect_size_LD_50kb.csv"
-    )
-    ADNI_FILE = Path(
-        "/data/ics328/ivy-hip-ubdt/JueqiWang/data/ADNI/final_AD_KEGG_pathway_with_all_genes_img_p_threshold_0.1_effect_size_LD_50kb.csv"
-    )
-    CROSS_VAL_INDEX_ACE = Path(
-        "/data/ics328/ivy-hip-ubdt/JueqiWang/data/ASD/10_10_cross_fold_val_index.pkl"
-    )
-    CROSS_VAL_INDEX_ADNI = Path(
-        "/data/ics328/ivy-hip-ubdt/JueqiWang/data/ADNI/10_10_cross_fold_val_index.pkl"
-    )
-elif os.environ.get("HOME") == "/usr3/graduate/jueqiw":
-    ABIDE_I_MNI = Path(
-        "/projectnb/ace-ig/ABIDE/ABIDE_I_BIDS/derivatives/MNI/"
-    ).resolve()
-    ABIDE_II_MNI = Path(
-        "/projectnb/ace-ig/ABIDE/ABIDE_II_BIDS/derivatives/MNI/"
-    ).resolve()
-    ABIDE_DATA_FOLDER_I = Path("/projectnb/ace-ig/ABIDE/ABIDE_I_ANTS/ABIDE/").resolve()
-    ABIDE_DATA_FOLDER_I_FREESURFER_RECON = Path(
-        "/projectnb/ace-ig/ABIDE/ABIDE_I_freesurfer_recon/ABIDE/"
-    ).resolve()
-    ABIDE_I_BIDS = Path("/projectnb/ace-ig/ABIDE/ABIDE_I_BIDS").resolve()
-    ABIDE_II_BIDS = Path("/projectnb/ace-ig/ABIDE/ABIDE_II_BIDS").resolve()
-    ABIDE_DATA_FOLDER_II = Path(
-        "/projectnb/ace-ig/ABIDE/ABIDE_II_T1/ABIDE_II/"
-    ).resolve()
-    ABIDE_I_PHENOTYPE = Path("/projectnb/ace-ig/ABIDE/Phenotypic_V1_0b.csv").resolve()
-    ABIDE_II_PHENOTYPE = Path(
-        "/projectnb/ace-ig/ABIDE/ABIDEII_Composite_Phenotypic.csv"
-    ).resolve()
-    ABIDE_II_PHENOTYPE_Long = Path(
-        "/projectnb/ace-ig/ABIDE/ABIDEII_Long_Composite_Phenotypic.csv"
-    ).resolve()
-    ACE_PHENOTYPE = Path("/projectnb/ace-ig/ace_phenotype.csv").resolve()
-    TENSORBOARD_LOG_DIR = Path(
-        "/projectnb/ace-ig/jueqiw/experiment/CrossModalityLearning/tensorboard"
-    ).resolve()
-    ACE_FILE = Path(
-        "/projectnb/ace-ig/jueqiw/dataset/BrainGenePathway/ACE/final_ACE_KEGG_pathway_with_all_genes_img_4_features_p_threshold_0.1_effect_size_LD_50kb_with_related.csv"
-    )
-    ADNI_FILE = Path(
-        "/projectnb/ace-ig/jueqiw/dataset/BrainGenePathway/ADNI/Gene/final_AD_KEGG_pathway_with_all_genes_img_p_threshold_0.1_effect_size_LD_50kb.csv"
-    )
-    CROSS_VAL_INDEX_ACE = Path(
-        "/projectnb/ace-ig/jueqiw/dataset/BrainGenePathway/ACE/10_10_cross_fold_val_index.pkl"
-    )
-    CROSS_VAL_INDEX_ADNI = Path(
-        "/projectnb/ace-ig/jueqiw/dataset/BrainGenePathway/ADNI/10_10_cross_fold_val_index.pkl"
-    )
-    RESULT_FOLDER = Path(
-        "/projectnb/ace-ig/jueqiw/experiment/BrainGenePathway/results"
-    ).resolve()
+ABIDE_I_MNI = Path("/projectnb/ace-ig/ABIDE/ABIDE_I_BIDS/derivatives/MNI/").resolve()
+ABIDE_II_MNI = Path("/projectnb/ace-ig/ABIDE/ABIDE_II_BIDS/derivatives/MNI/").resolve()
+ABIDE_DATA_FOLDER_I = Path("/projectnb/ace-ig/ABIDE/ABIDE_I_ANTS/ABIDE/").resolve()
+ABIDE_DATA_FOLDER_I_FREESURFER_RECON = Path(
+    "/projectnb/ace-ig/ABIDE/ABIDE_I_freesurfer_recon/ABIDE/"
+).resolve()
+ABIDE_I_BIDS = Path("/projectnb/ace-ig/ABIDE/ABIDE_I_BIDS").resolve()
+ABIDE_II_BIDS = Path("/projectnb/ace-ig/ABIDE/ABIDE_II_BIDS").resolve()
+ABIDE_DATA_FOLDER_II = Path("/projectnb/ace-ig/ABIDE/ABIDE_II_T1/ABIDE_II/").resolve()
+ABIDE_I_PHENOTYPE = Path("/projectnb/ace-ig/ABIDE/Phenotypic_V1_0b.csv").resolve()
+ABIDE_II_PHENOTYPE = Path(
+    "/projectnb/ace-ig/ABIDE/ABIDEII_Composite_Phenotypic.csv"
+).resolve()
+ABIDE_II_PHENOTYPE_Long = Path(
+    "/projectnb/ace-ig/ABIDE/ABIDEII_Long_Composite_Phenotypic.csv"
+).resolve()
+ACE_PHENOTYPE = Path("/projectnb/ace-ig/ace_phenotype.csv").resolve()
+TENSORBOARD_LOG_DIR = Path(
+    "/projectnb/ace-ig/jueqiw/experiment/CrossModalityLearning/tensorboard"
+).resolve()
+ACE_FILE = Path(
+    "/projectnb/ace-ig/jueqiw/dataset/BrainGenePathway/ACE/final_ACE_KEGG_pathway_with_all_genes_img_4_features_p_threshold_0.1_effect_size_LD_50kb_with_related.csv"
+)
+ADNI_FILE = Path(
+    "/projectnb/ace-ig/jueqiw/dataset/BrainGenePathway/ADNI/Gene/final_AD_KEGG_pathway_with_all_genes_img_p_threshold_0.1_effect_size_LD_50kb.csv"
+)
+CROSS_VAL_INDEX_ACE = Path(
+    "/projectnb/ace-ig/jueqiw/dataset/BrainGenePathway/ACE/10_10_cross_fold_val_index.pkl"
+)
+CROSS_VAL_INDEX_ADNI = Path(
+    "/projectnb/ace-ig/jueqiw/dataset/BrainGenePathway/ADNI/10_10_cross_fold_val_index.pkl"
+)
+RESULT_FOLDER = Path(
+    "/projectnb/ace-ig/jueqiw/experiment/BrainGenePathway/results"
+).resolve()
 
 DATA_FOLDER = Path("/projectnb/ace-ig/ABIDE/ABIDE_I_ANTS/ABIDE/").resolve()
 
