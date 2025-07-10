@@ -8,12 +8,13 @@ from monai.data import CacheDataset, DataLoader, Dataset, decollate_batch
 import matplotlib.pyplot as plt
 import nibabel as nib
 
+
 from utils.const import ABIDE_I_MNI, ABIDE_II_MNI
 from utils.transforms import get_train_data_transform
 
 
 def create_2D_image(path: Path) -> list:
-    imgs = ABIDE_I_MNI.glob(
+    imgs = ABIDE_II_MNI.glob(
         "**/sub-*_space-MNI152NLin2009cAsym_desc-preproc_T1w.nii.gz"
     )
 
@@ -30,16 +31,12 @@ def create_2D_image(path: Path) -> list:
 
 
 if __name__ == "__main__":
-    dataset_name = "I"
-    if dataset_name == "I":
-        sample_dicts = create_2D_image(ABIDE_I_MNI)
-    elif dataset_name == "II":
-        sample_dicts = create_2D_image(ABIDE_II_MNI)
+    dataset_name = "II"
+    sample_dicts = create_2D_image(ABIDE_II_MNI)
 
     train_transform = get_train_data_transform()
     train_ds = Dataset(data=sample_dicts, transform=train_transform)
     train_loader = DataLoader(train_ds, batch_size=1, shuffle=True, num_workers=8)
-
     n_epochs = 1
 
     # make folder structure
@@ -73,6 +70,7 @@ if __name__ == "__main__":
                 coronal = np.rot90(img[:, cy + j, :], k=2)
                 axial = np.rot90(img[:, :, cz + j], k=1)
                 # flip the axial view to get the correct orientation
+                # axial = np.flipud(axial)
                 axial = np.fliplr(axial)
 
                 # save as separate images

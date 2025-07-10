@@ -144,6 +144,7 @@ def get_train_data_transform() -> Compose:
                 keys=["baseline_img", "baseline_mask", "followup_img", "followup_mask"],
                 spatial_size=[196, 196, 196],
             ),
+            # might need to change here?
             ScaleIntensityRangePercentilesd(
                 keys=[
                     "baseline_img",
