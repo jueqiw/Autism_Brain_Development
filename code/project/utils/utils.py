@@ -8,16 +8,12 @@ from collections import defaultdict
 
 import shutil
 import numpy as np
-import seaborn as sns
 import pandas as pd
 import torch
 import matplotlib.pyplot as plt
 from torch import Tensor
 from torch.utils.tensorboard import SummaryWriter
-from sklearn.manifold import TSNE
-from sklearn.decomposition import PCA
 from pathlib import Path
-from sklearn import metrics
 
 from utils.process_data import cpu, cpu_t
 from utils.const import (
@@ -94,6 +90,53 @@ def get_ABIDE_I_subject(
     )
 
     return train_samples, val_samples
+
+
+def get_ABIDE_II_subject_followup() -> List[dict]:
+    ABIDE_II_Baseline = Path(
+        "/projectnb/ace-ig/ABIDE/ABIDE_II_BIDS_Baseline/derivatives/MNI"
+    ).resolve()
+    ABIDE_II = ABIDE_II_Baseline.glob(
+        "**/sub-*_space-MNI152NLin2009cAsym_desc-preproc_T1w.nii.gz"
+    )
+
+    ABIDE_II_long_phenotype_file = pd.read_csv(ABIDE_II_PHENOTYPE_Long)
+
+    sample_dicts = []
+
+    for path in ABIDE_II:
+        baseline_mask_path = str(path).replace("preproc_T1w", "brain_mask")
+        m = re.search(r"-(\d{5})(?=[/_])", str(path))
+        if m:
+            subject_id = m.group(1)
+            followup_img_path = str(path).replace(
+                "ABIDE_II_BIDS_Baseline", "ABIDE_II_BIDS"
+            )
+            followup_mask_path = str(baseline_mask_path).replace(
+                "ABIDE_II_BIDS_Baseline", "ABIDE_II_BIDS"
+            )
+
+            row = ABIDE_II_long_phenotype_file[
+                ABIDE_II_long_phenotype_file["SUB_ID"] == int(subject_id)
+            ]
+
+            baseline_row = row[row["SESSION"] == "Baseline"]
+            followup_row = row[row["SESSION"] == "Followup_1"]
+            sample_dicts.append(
+                {
+                    "baseline_img": str(path),
+                    "baseline_mask": baseline_mask_path,
+                    "followup_img": followup_img_path,
+                    "followup_mask": followup_mask_path,
+                    "baseline_age": baseline_row["AGE_AT_SCAN "].values[0],
+                    "followup_age": followup_row["AGE_AT_SCAN "].values[0],
+                    "label": int(row["DX_GROUP"].values[0]) - 1,
+                    "subject_id": subject_id,
+                    "site_id": row["SITE_ID"].values[0],
+                }
+            )
+
+    return sample_dicts
 
 
 def get_ABIDE_II_subject() -> List[dict]:
