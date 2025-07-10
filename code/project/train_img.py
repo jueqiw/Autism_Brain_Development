@@ -60,9 +60,6 @@ def visualize(followup_img, baseline_img, followup_mask, baseline_mask):
             fixed=fixed_img,
             moving=moving_img,
             type_of_transform="SyN",
-            syn_metric="CC",
-            syn_sampling=32,
-            reg_iterations=[40, 20, 0],
         )
 
         # Create jacobian determinant
