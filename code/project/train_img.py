@@ -102,7 +102,9 @@ if __name__ == "__main__":
         )
 
     mean_jacobian_map = np.mean(jacobian_maps, axis=0)
-    plt.imshow(mean_jacobian_map, cmap="gray")
+    # take one slice from the 3D image for visualization
+    mean_jacobian_map_2D = mean_jacobian_map[:, :, mean_jacobian_map.shape[2] // 2]
+    plt.imshow(mean_jacobian_map_2D, cmap="gray")
     plt.title("Mean Jacobian Map")
     plt.colorbar()
     # save image
