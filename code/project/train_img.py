@@ -89,6 +89,7 @@ if __name__ == "__main__":
         followup_img = train_batch_data["followup_img"][0]
         baseline_mask = train_batch_data["baseline_mask"][0]
         followup_mask = train_batch_data["followup_mask"][0]
+        label = train_batch_data["label"][0]
         # Visualize the subject's MRI data
         jacobian_map = visualize(
             followup_img, baseline_img, followup_mask, baseline_mask
@@ -100,6 +101,13 @@ if __name__ == "__main__":
             train_batch_data["baseline_age"][0],
             train_batch_data["followup_age"][0],
         )
+
+    # save numpy array of jacobian maps
+    jacobian_maps = np.array(jacobian_maps)
+    np.save(
+        f"/project/ace-genetics/jueqiw/jacobian_{train_batch_data['subject_id']}.npy",
+        jacobian_maps,
+    )
 
     mean_jacobian_map = np.mean(jacobian_maps, axis=0)
     # take one slice from the 3D image for visualization
