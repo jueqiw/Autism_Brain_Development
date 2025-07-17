@@ -2,6 +2,7 @@ import os
 import re
 import sys
 import random
+import pickle
 from argparse import Namespace
 from typing import List, Optional, Tuple
 from collections import defaultdict
@@ -21,6 +22,8 @@ from utils.const import (
     ABIDE_DATA_FOLDER_I,
     ABIDE_DATA_FOLDER_I_FREESURFER_RECON,
     ABIDE_DATA_FOLDER_II,
+    ABIDE_I_transform,
+    ABIDE_II_transform,
     ABIDE_I_MNI,
     ABIDE_II_MNI,
     ABIDE_I_PHENOTYPE,
@@ -30,16 +33,39 @@ from utils.const import (
 )
 
 
-def get_ABIDE_I_subject(
-    train_percent: float = 0.9,
-) -> Tuple[List[dict], List[dict]]:
-    ABIDE_I = ABIDE_I_MNI.glob(
-        "**/sub-*_space-MNI152NLin2009cAsym_desc-preproc_T1w.nii.gz"
-    )
+def create_training_samples() -> List[dict]:
+    samples_ABIDE_I, n_subjects_lower_21_I = get_ABIDE_I_subject()
+    samples_ABIDE_II, n_subjects_lower_21_II = get_ABIDE_II_subject()
 
+    print(f"Number of subjects in ABIDE I: {len(samples_ABIDE_I)}")
+    print(f"Number of subjects in ABIDE II: {len(samples_ABIDE_II)}")
+    print(f"Number of subjects with age <= 21 in ABIDE I: {n_subjects_lower_21_I}")
+    print(f"Number of subjects with age <= 21 in ABIDE II: {n_subjects_lower_21_II}")
+
+    # merge the two dicts
+    merged_samples = samples_ABIDE_I + samples_ABIDE_II
+    sorted_samples = sorted(merged_samples, key=lambda x: x["age"])
+
+    with open("samples_ABIDE_merged.pkl", "wb") as f:
+        pickle.dump(merged_samples, f)
+
+    with open("samples_ABIDE_merged.pkl", "rb") as f:
+        samples = pickle.load(f)
+
+    return samples
+
+
+def get_ABIDE_I_transformed_subject() -> List[dict]:
+    ABIDE_I = ABIDE_I_transform.glob("**/transformed_*.nii.gz")
     ABIDE_I_phenotype_file = pd.read_csv(ABIDE_I_PHENOTYPE)
-    # ABIDE_II_phenotype_file = pd.read_csv(ABIDE_II_PHENOTYPE, encoding="cp1252")
-    # ABIDE_II_long_phenotype_file = pd.read_csv(ABIDE_II_PHENOTYPE_Long)
+    ABIDE_II_phenotype_file = pd.read_csv(ABIDE_II_PHENOTYPE_Long)
+
+    longitudinal_subjects = set(
+        # turn it to string
+        ABIDE_II_phenotype_file[ABIDE_II_phenotype_file["SESSION"] == "Baseline"][
+            "SUB_ID"
+        ].values.astype(str)
+    )
 
     sample_dicts = []
     for path in ABIDE_I:
@@ -47,31 +73,24 @@ def get_ABIDE_I_subject(
         if m:
             subject_id = m.group(1)
 
-        # get the row of ABIDE_I_phenotype_file with the subject_id == SUB_ID
         row = ABIDE_I_phenotype_file[
             ABIDE_I_phenotype_file["SUB_ID"] == int(subject_id)
         ]
+        if row.empty:
+            print(
+                f"Warning: No phenotype data found for subject {subject_id}. Skipping."
+            )
+            continue
 
-        # replace part of the string
         mask_path = str(path).replace("preproc_T1w", "brain_mask")
+        age = row["AGE_AT_SCAN"].values[0] if "AGE_AT_SCAN" in row else None
 
-        # for path in ABIDE_II:
-        #     m = re.search(r"_(\d{5})(?=[/_])", str(path))
-        #     if m:
-        #         subject_id = m.group(1)
+        if subject_id in longitudinal_subjects:
+            print(f"subject {subject_id} is in the skip list, skipping.")
+            continue
 
-        #     pos_base = str(path).find("baseline")
-        #     pos_foll = str(path).find("followup")
-        #     if pos_base != -1:
-        #         row = ABIDE_II_long_phenotype_file[
-        #             ABIDE_II_long_phenotype_file["SUB_ID"] == int(subject_id)
-        #         ]
-        #     elif pos_foll != -1:
-        #         continue
-        #     else:
-        #         row = ABIDE_II_phenotype_file[
-        #             ABIDE_II_phenotype_file["SUB_ID"] == int(subject_id)
-        #         ]
+        if age is None:
+            continue
 
         sample_dicts.append(
             {
@@ -80,16 +99,77 @@ def get_ABIDE_I_subject(
                 "label": int(row["DX_GROUP"].values[0]) - 1,
                 "subject_id": subject_id,
                 "site_id": row["SITE_ID"].values[0],
+                "age": age,
+                "dataset": "I",
             }
         )
 
-    n_train_samples = int(len(sample_dicts) * train_percent)
-    train_samples, val_samples = (
-        sample_dicts[:n_train_samples],
-        sample_dicts[n_train_samples:],
+    return (sample_dicts, n_subjects_lower_21)
+
+
+def get_ABIDE_I_subject() -> List[dict]:
+    ABIDE_I = ABIDE_I_MNI.glob(
+        "**/sub-*_space-MNI152NLin2009cAsym_desc-preproc_T1w.nii.gz"
+    )
+    ABIDE_I_phenotype_file = pd.read_csv(ABIDE_I_PHENOTYPE)
+    ABIDE_II_phenotype_file = pd.read_csv(ABIDE_II_PHENOTYPE_Long)
+
+    n_subjects_lower_21 = 0
+
+    longitudinal_subjects = set(
+        # turn it to string
+        ABIDE_II_phenotype_file[ABIDE_II_phenotype_file["SESSION"] == "Baseline"][
+            "SUB_ID"
+        ].values.astype(str)
     )
 
-    return train_samples, val_samples
+    print(f"Number of subjects in ABIDE I: {longitudinal_subjects}")
+
+    sample_dicts = []
+    for path in ABIDE_I:
+        m = re.search(r"-(\d{5})(?=_)", str(path))
+        if m:
+            subject_id = m.group(1)
+
+        row = ABIDE_I_phenotype_file[
+            ABIDE_I_phenotype_file["SUB_ID"] == int(subject_id)
+        ]
+        if row.empty:
+            print(
+                f"Warning: No phenotype data found for subject {subject_id}. Skipping."
+            )
+            continue
+
+        mask_path = str(path).replace("preproc_T1w", "brain_mask")
+        age = row["AGE_AT_SCAN"].values[0] if "AGE_AT_SCAN" in row else None
+
+        if subject_id in longitudinal_subjects:
+            print(f"subject {subject_id} is in the skip list, skipping.")
+            continue
+
+        # print(f"Processing subject {subject_id} with age {age}")
+        if age is None:
+            # print(f"Age data missing for subject {subject_id}. Skipping.")
+            continue
+
+        if age <= 21:
+            n_subjects_lower_21 += 1
+            # print(f"Skipping subject {subject_id} with age {age} (<= 21)")
+            continue
+
+        sample_dicts.append(
+            {
+                "img": str(path),
+                "mask": mask_path,
+                "label": int(row["DX_GROUP"].values[0]) - 1,
+                "subject_id": subject_id,
+                "site_id": row["SITE_ID"].values[0],
+                "age": age,
+                "dataset": "I",
+            }
+        )
+
+    return (sample_dicts, n_subjects_lower_21)
 
 
 def get_ABIDE_II_subject_followup() -> List[dict]:
@@ -99,9 +179,7 @@ def get_ABIDE_II_subject_followup() -> List[dict]:
     ABIDE_II = ABIDE_II_Baseline.glob(
         "**/sub-*_space-MNI152NLin2009cAsym_desc-preproc_T1w.nii.gz"
     )
-
     ABIDE_II_long_phenotype_file = pd.read_csv(ABIDE_II_PHENOTYPE_Long)
-
     sample_dicts = []
 
     for path in ABIDE_II:
@@ -115,7 +193,6 @@ def get_ABIDE_II_subject_followup() -> List[dict]:
             followup_mask_path = str(baseline_mask_path).replace(
                 "ABIDE_II_BIDS_Baseline", "ABIDE_II_BIDS"
             )
-
             row = ABIDE_II_long_phenotype_file[
                 ABIDE_II_long_phenotype_file["SUB_ID"] == int(subject_id)
             ]
@@ -139,16 +216,14 @@ def get_ABIDE_II_subject_followup() -> List[dict]:
     return sample_dicts
 
 
-def get_ABIDE_II_subject() -> List[dict]:
+def get_ABIDE_II_subject() -> Tuple[List[dict], int]:
     ABIDE_II = ABIDE_II_MNI.glob(
         "**/sub-*_space-MNI152NLin2009cAsym_desc-preproc_T1w.nii.gz"
     )
 
-    # ABIDE_I_phenotype_file = pd.read_csv(ABIDE_I_PHENOTYPE)
     ABIDE_II_phenotype_file = pd.read_csv(ABIDE_II_PHENOTYPE, encoding="cp1252")
-    ABIDE_II_long_phenotype_file = pd.read_csv(ABIDE_II_PHENOTYPE_Long)
-
     sample_dicts = []
+    n_subjects_lower_21 = 0
 
     for path in ABIDE_II:
         mask_path = str(path).replace("preproc_T1w", "brain_mask")
@@ -158,13 +233,25 @@ def get_ABIDE_II_subject() -> List[dict]:
 
         # if subject id starts with 5
         if subject_id.startswith("5"):
-            row = ABIDE_II_long_phenotype_file[
-                ABIDE_II_long_phenotype_file["SUB_ID"] == int(subject_id)
-            ]
+            continue
         else:
             row = ABIDE_II_phenotype_file[
                 ABIDE_II_phenotype_file["SUB_ID"] == int(subject_id)
             ]
+
+        if row.empty:
+            # print(f"Warning: No phenotype data found for subject {subject_id}. Skipping.")
+            continue
+
+        age = row["AGE_AT_SCAN "].values[0] if "AGE_AT_SCAN " in row else None
+
+        if age is None:
+            # print(f"Age data missing for subject {subject_id}. Skipping.")
+            continue
+
+        if age <= 21:
+            n_subjects_lower_21 += 1
+            continue
 
         sample_dicts.append(
             {
@@ -173,10 +260,12 @@ def get_ABIDE_II_subject() -> List[dict]:
                 "label": int(row["DX_GROUP"].values[0]) - 1,
                 "subject_id": subject_id,
                 "site_id": row["SITE_ID"].values[0],
+                "age": age,
+                "dataset": "II",
             }
         )
 
-    return sample_dicts
+    return (sample_dicts, n_subjects_lower_21)
 
 
 def get_ACE_subjects() -> List[dict]:
