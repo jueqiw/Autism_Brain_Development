@@ -4,16 +4,16 @@ import os
 if __name__ == "__main__":
     for i in range(20):
         if Path(
-            f"/project/ace-genetics/jueqiw/Autism_Brain_Development/code/scripts/ABIDE_{i}.sh"
+            f"/project/ace-genetics/jueqiw/code/Autism_Brain_Development/code/scripts/ABIDE_{i}.sh"
         ).exists():
             os.remove(
                 Path(
-                    f"/project/ace-genetics/jueqiw/Autism_Brain_Development/code/scripts/ABIDE_{i}.sh"
+                    f"/project/ace-genetics/jueqiw/code/Autism_Brain_Development/code/scripts/ABIDE_{i}.sh"
                 )
             )
         with open(
             Path(
-                f"/project/ace-genetics/jueqiw/Autism_Brain_Development/code/scripts/ABIDE_{i}.sh"
+                f"/project/ace-genetics/jueqiw/code/Autism_Brain_Development/code/scripts/ABIDE_{i}.sh"
             ),
             "a",
         ) as f:
@@ -32,10 +32,10 @@ if __name__ == "__main__":
             )
             f.write("module load pytorch/1.13.1\n")
             f.write(
-                f"python /project/ace-genetics/jueqiw/Autism_Brain_Development/code/project/create_batch_file_for_synthesized_image.py --id={i}\n"
+                f"python /project/ace-genetics/jueqiw/code/Autism_Brain_Development/code/project/create_batch_file_for_synthesized_image.py --id={i}\n"
             )
 
-    for i in range(21):
-        os.system(
-            f"qsub /project/ace-genetics/jueqiw/Autism_Brain_Development/code/scripts/ABIDE_{i}.sh"
-        )
+for i in range(21):
+    os.system(
+        f"qsub /project/ace-genetics/jueqiw/code/Autism_Brain_Development/code/scripts/ABIDE_{i}.sh"
+    )

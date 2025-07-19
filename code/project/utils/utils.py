@@ -55,8 +55,72 @@ def create_training_samples() -> List[dict]:
     return samples
 
 
+def get_ABIDE_II_transformed_subject() -> List[dict]:
+    ABIDE_II = list(ABIDE_II_transform.glob("**/transformed_*.nii.gz"))
+    ABIDE_II_phenotype_file = pd.read_csv(ABIDE_II_PHENOTYPE, encoding="cp1252")
+    ABIDE_II_phenotype_file_Longi = pd.read_csv(ABIDE_II_PHENOTYPE_Long)
+
+    longitudinal_subjects = set(
+        # turn it to string
+        ABIDE_II_phenotype_file_Longi[ABIDE_II_phenotype_file_Longi["SESSION"] == "Baseline"][
+            "SUB_ID"
+        ].values.astype(str)
+    )
+
+    sample_dicts = []
+    for path in ABIDE_II:
+        m = re.search(r"-(\d{5})(?=/)", str(path))
+        if m:
+            subject_id = m.group(1)
+
+        if subject_id.startswith("5"):
+            continue
+        else:
+            row = ABIDE_II_phenotype_file[
+                ABIDE_II_phenotype_file["SUB_ID"] == int(subject_id)
+            ]
+
+        if row.empty:
+            print(
+                f"Warning: No phenotype data found for subject {subject_id}. Skipping."
+            )
+            continue
+
+        img_path = f"/projectnb/ace-ig/ABIDE/ABIDE_II_BIDS/derivatives/MNI/sub-{subject_id}/anat/sub-{subject_id}_space-MNI152NLin2009cAsym_desc-preproc_T1w.nii.gz"
+        mask_path = str(img_path).replace("preproc_T1w", "brain_mask")
+        age = row["AGE_AT_SCAN "].values[0] if "AGE_AT_SCAN " in row else None
+        transformed_img_path = str(path)
+        digits = re.search(r"transformed_(\d+)", str(path))
+        jacobian_path = str(path).replace("transformed_", "sim_BN_targetJac_")
+        dispfield_path = str(path).replace("transformed_", "sim_BN_dispfield_")
+
+        if subject_id in longitudinal_subjects:
+            print(f"subject {subject_id} is in the skip list, skipping.")
+            continue
+
+        if age is None:
+            continue
+
+        sample_dicts.append(
+            {
+                "img": str(img_path),
+                "mask": mask_path,
+                "transformed_img": transformed_img_path,
+                "jacobian": jacobian_path,
+                "dispfield": dispfield_path,
+                "label": int(row["DX_GROUP"].values[0]) - 1,
+                "subject_id": subject_id,
+                "site_id": row["SITE_ID"].values[0],
+                "age": age,
+                "dataset": "II",
+                "digits": digits.group(1),
+            }
+        )
+
+    return sample_dicts
+
 def get_ABIDE_I_transformed_subject() -> List[dict]:
-    ABIDE_I = ABIDE_I_transform.glob("**/transformed_*.nii.gz")
+    ABIDE_I = list(ABIDE_I_transform.glob("**/transformed_*.nii.gz"))
     ABIDE_I_phenotype_file = pd.read_csv(ABIDE_I_PHENOTYPE)
     ABIDE_II_phenotype_file = pd.read_csv(ABIDE_II_PHENOTYPE_Long)
 
@@ -69,7 +133,7 @@ def get_ABIDE_I_transformed_subject() -> List[dict]:
 
     sample_dicts = []
     for path in ABIDE_I:
-        m = re.search(r"-(\d{5})(?=_)", str(path))
+        m = re.search(r"-(\d{5})(?=/)", str(path))
         if m:
             subject_id = m.group(1)
 
@@ -82,8 +146,13 @@ def get_ABIDE_I_transformed_subject() -> List[dict]:
             )
             continue
 
-        mask_path = str(path).replace("preproc_T1w", "brain_mask")
+        img_path = f"/projectnb/ace-ig/ABIDE/ABIDE_I_BIDS/derivatives/MNI/sub-{subject_id}/anat/sub-{subject_id}_space-MNI152NLin2009cAsym_desc-preproc_T1w.nii.gz"
+        mask_path = str(img_path).replace("preproc_T1w", "brain_mask")
         age = row["AGE_AT_SCAN"].values[0] if "AGE_AT_SCAN" in row else None
+        transformed_img_path = str(path)
+        digits = re.search(r"transformed_(\d+)", str(path))
+        jacobian_path = str(path).replace("transformed_", "sim_BN_targetJac_")
+        dispfield_path = str(path).replace("transformed_", "sim_BN_dispfield_")
 
         if subject_id in longitudinal_subjects:
             print(f"subject {subject_id} is in the skip list, skipping.")
@@ -94,17 +163,21 @@ def get_ABIDE_I_transformed_subject() -> List[dict]:
 
         sample_dicts.append(
             {
-                "img": str(path),
+                "img": str(img_path),
                 "mask": mask_path,
+                "transformed_img": transformed_img_path,
+                "jacobian": jacobian_path,
+                "dispfield": dispfield_path,
                 "label": int(row["DX_GROUP"].values[0]) - 1,
                 "subject_id": subject_id,
                 "site_id": row["SITE_ID"].values[0],
                 "age": age,
                 "dataset": "I",
+                "digits": digits.group(1),
             }
         )
 
-    return (sample_dicts, n_subjects_lower_21)
+    return sample_dicts
 
 
 def get_ABIDE_I_subject() -> List[dict]:

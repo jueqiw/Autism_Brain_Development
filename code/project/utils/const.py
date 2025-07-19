@@ -1,8 +1,8 @@
 import os
 from pathlib import Path
 
-ABIDE_I_transform = Path("projectnb/ace-genetics/ABIDE/ABIDE_I").resolve()
-ABIDE_II_transform = Path("projectnb/ace-genetics/ABIDE/ABIDE_II").resolve()
+ABIDE_I_transform = Path("/projectnb/ace-genetics/ABIDE/ABIDE_I").resolve()
+ABIDE_II_transform = Path("/projectnb/ace-genetics/ABIDE/ABIDE_II").resolve()
 ABIDE_I_MNI = Path("/projectnb/ace-ig/ABIDE/ABIDE_I_BIDS/derivatives/MNI/").resolve()
 ABIDE_II_MNI = Path("/projectnb/ace-ig/ABIDE/ABIDE_II_BIDS/derivatives/MNI/").resolve()
 ABIDE_DATA_FOLDER_I = Path("/projectnb/ace-ig/ABIDE/ABIDE_I_ANTS/ABIDE/").resolve()

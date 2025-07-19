@@ -23,6 +23,9 @@ from monai.transforms import (
     RandRotated,
     RandZoomd,
     RandAffined,
+    RandGaussianNoised,
+    RandBiasFieldd,
+    Lambdad,
 )
 
 
@@ -117,6 +120,71 @@ class GetCenterAdjacentImg(MapTransform):
 
         return sample
 
+def get_transformed_train_data_transform() -> Compose:
+    return Compose(
+        [
+            LoadImaged(
+                keys=["img", "mask", "transformed_img", "jacobian", "dispfield"],
+            ),
+            EnsureChannelFirstd(
+                keys=["img", "mask", "transformed_img", "jacobian", "dispfield"]
+            ),
+            Lambdad(
+                keys=["dispfield"],
+                func=lambda x: torch.squeeze(x, dim=-1) if x.shape[-1] == 1 else x
+            ),
+
+            Orientationd(
+                keys=["img", "mask", "transformed_img", "jacobian", "dispfield"],
+                axcodes="RAS",
+            ),
+            Spacingd(
+                keys=["img", "mask", "transformed_img", "jacobian", "dispfield"],
+                pixdim=(1.0, 1.0, 1.0),
+                mode=("bilinear", "nearest", "bilinear", "nearest", "bilinear"),
+            ),
+            CenterSpatialCropd(
+                keys=["img", "mask", "transformed_img", "jacobian", "dispfield"],
+                roi_size=[196, 196, 196],
+            ),
+            SpatialPadd(
+                keys=["img", "mask", "transformed_img", "jacobian", "dispfield"],
+                spatial_size=[196, 196, 196],
+            ),
+            ScaleIntensityRangePercentilesd(
+                keys=[
+                    "img",
+                    "transformed_img",
+                ],
+                lower=0.5,
+                upper=99.5,
+                b_min=0.0,
+                b_max=1.0,
+                clip=True,
+            ),
+            RandGaussianNoised(
+                keys=["img"],
+                prob=0.5,
+                mean=0.0,
+                std=0.08,
+            ),
+            RandGaussianNoised(
+                keys=["transformed_img"],
+                prob=1,
+                mean=0.0,
+                std=0.08,
+            ),
+            RandBiasFieldd(
+                keys=["img"],
+                prob=0.5,
+            ),
+            RandBiasFieldd(
+                keys=["transformed_img"],
+                prob=1,
+            ),
+        ]
+    )
+
 
 def get_train_data_transform() -> Compose:
     return Compose(
@@ -158,8 +226,8 @@ def get_train_data_transform() -> Compose:
                 b_max=1.0,
                 clip=True,
             ),
-            # ToTensord(
-            #     keys=["img", "label"],
-            # ),
+            ToTensord(
+                keys=["img", "label"],
+            ),
         ]
     )
