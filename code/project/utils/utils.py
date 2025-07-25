@@ -62,9 +62,9 @@ def get_ABIDE_II_transformed_subject() -> List[dict]:
 
     longitudinal_subjects = set(
         # turn it to string
-        ABIDE_II_phenotype_file_Longi[ABIDE_II_phenotype_file_Longi["SESSION"] == "Baseline"][
-            "SUB_ID"
-        ].values.astype(str)
+        ABIDE_II_phenotype_file_Longi[
+            ABIDE_II_phenotype_file_Longi["SESSION"] == "Baseline"
+        ]["SUB_ID"].values.astype(str)
     )
 
     sample_dicts = []
@@ -118,6 +118,7 @@ def get_ABIDE_II_transformed_subject() -> List[dict]:
         )
 
     return sample_dicts
+
 
 def get_ABIDE_I_transformed_subject() -> List[dict]:
     ABIDE_I = list(ABIDE_I_transform.glob("**/transformed_*.nii.gz"))

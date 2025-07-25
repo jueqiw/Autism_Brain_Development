@@ -1,433 +1,661 @@
-##
-# Usage: python 3D_MRI_VAE_regression.py ROI_x ROI_y ROI_z Size_x Size_y Size_z
-# ROI_x,y,z, Size_x,y,z: Selecting a specific ROI box for analysis
-# Reach out to http://cnslab.stanford.edu/ for data usage
-
-
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
-from tensorflow.keras.models import Sequential, Model
-from tensorflow.keras.layers import (
-    Activation,
-    Dense,
-    Dropout,
-    Flatten,
-    UpSampling2D,
-    Input,
-    ZeroPadding2D,
-    Lambda,
-    Reshape,
-)
-from tensorflow.keras.layers import BatchNormalization
-from tensorflow.keras.layers import Conv2D, MaxPooling2D
-from tensorflow.keras.losses import (
-    MeanSquaredError,
-    BinaryCrossentropy,
-    MeanAbsoluteError,
-)
-
-# from keras.losses import mse, binary_crossentropy,mean_absolute_error
-from tensorflow.keras.utils import plot_model
-from tensorflow.keras.constraints import unit_norm, max_norm
-from tensorflow.keras import regularizers
-from tensorflow.keras import backend as K
-
-from sklearn.model_selection import StratifiedKFold
-import nibabel as nib
-import scipy as sp
-import scipy.ndimage
-from sklearn.metrics import mean_squared_error, r2_score
+import os
+import glob
+from argparse import ArgumentParser
+from concurrent.futures import ThreadPoolExecutor
+import pickle
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import sys
-import argparse
-import os
-import glob
+import scipy.ndimage
 from PIL import Image
+from sklearn.model_selection import StratifiedKFold
+from sklearn.metrics import mean_squared_error, r2_score
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader, Subset
+from torch.utils.tensorboard import SummaryWriter
+from monai.transforms import (
+    Compose,
+    LoadImage,
+    EnsureChannelFirst,
+    Resize,
+    ScaleIntensityRange,
+    ToTensor,
+)
+from monai.data import CacheDataset
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+
+from utils.add_argument import add_argument  # Assuming this is the correct import path
+from utils.const import (
+    ABIDE_I_2D_REGRESSION,
+    ABIDE_II_2D_REGRESSION,
+    ABIDE_PATH,
+    PRE_TRAINED_WEIGHTS,
+)
+from models.vae import create_vae_model
+
+torch.set_num_threads(8)  # or the number you request
+os.environ["OMP_NUM_THREADS"] = "8"
+os.environ["MKL_NUM_THREADS"] = "8"
+
+# Set device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# reparameterization trick
-# instead of sampling from Q(z|X), sample eps = N(0,I)
-# z = z_mean + sqrt(var)*eps
-def sampling(args):
-    """Reparameterization trick by sampling fr an isotropic unit Gaussian.
-    # Arguments:
-        args (tensor): mean and log of variance of Q(z|X)
-    # Returns:
-        z (tensor): sampled latent vector
-    """
-
-    z_mean, z_log_var = args
-    batch = K.shape(z_mean)[0]
-    dim = K.int_shape(z_mean)[1]
-    # by default, random_normal has mean=0 and std=1.0
-    epsilon = K.random_normal(shape=(batch, dim))
-    thre = K.random_uniform(shape=(batch, 1))
-    return z_mean + K.exp(0.5 * z_log_var) * epsilon
+# MONAI transforms for data preprocessing (no augmentation)
+data_transforms = Compose(
+    [
+        LoadImage(image_only=True),
+        EnsureChannelFirst(),
+        Resize((192, 192)),
+        ScaleIntensityRange(a_min=0.5, a_max=99.5, b_min=0.0, b_max=1.0, clip=True),
+        ToTensor(),
+    ]
+)
 
 
-def augment_by_transformation(data, age, n):
-    augment_scale = 1
-
-    if n <= data.shape[0]:
-        return data
-    else:
-        raw_n = data.shape[0]
-        m = n - raw_n
-        for i in range(0, m):
-            new_data = np.zeros((1, data.shape[1], data.shape[2], data.shape[3], 1))
-            idx = np.random.randint(0, raw_n)
-            new_age = age[idx]
-            new_data[0] = data[idx].copy()
-            new_data[0, :, :, :, 0] = sp.ndimage.interpolation.rotate(
-                new_data[0, :, :, :, 0],
-                np.random.uniform(-1, 1),
-                axes=(1, 0),
-                reshape=False,
-            )
-            new_data[0, :, :, :, 0] = sp.ndimage.interpolation.rotate(
-                new_data[0, :, :, :, 0],
-                np.random.uniform(-1, 1),
-                axes=(0, 1),
-                reshape=False,
-            )
-            new_data[0, :, :, :, 0] = sp.ndimage.shift(
-                new_data[0, :, :, :, 0], np.random.uniform(-1, 1)
-            )
-            data = np.concatenate((data, new_data), axis=0)
-            age = np.append(age, new_age)
-
-        return data, age
-
-
-def augment_by_noise(data, n, sigma):
-    if n <= data.shape[0]:
-        return data
-    else:
-        m = n - data.shape[0]
-        for i in range(0, m):
-            new_data = np.zeros((1, data.shape[1], data.shape[2], data.shape[3], 1))
-            new_data[0] = data[np.random.randint(0, data.shape[0])]
-            noise = np.clip(
-                np.random.normal(
-                    0, sigma, (data.shape[1], data.shape[2], data.shape[3], 1)
-                ),
-                -3 * sigma,
-                3 * sigma,
-            )
-            new_data[0] += noise
-            data = np.concatenate((data, new_data), axis=0)
-        return data
-
-
-def augment_by_flip(data):
-    data_flip = np.flip(data, 1)
-    data = np.concatenate((data, data_flip), axis=0)
-    return data
-
-
-####### Main Script #######
-""" not cropping for ROI
-min_x = int(sys.argv[1])    
-min_y = int(sys.argv[2])  
-min_z = int(sys.argv[3])  
-patch_x = int(sys.argv[4])    
-patch_y = int(sys.argv[5])    
-patch_z = int(sys.argv[6]) 
-"""
-
-# dropout_alpha = float(sys.argv[7])
-# L2_reg = float(sys.argv[8])
-
-## CNN Parameters
-dropout_alpha = 0.5
-ft_bank_baseline = 16
-latent_dim = 16
-augment_size = 1000
-L2_reg = 0.00
-binary_image = False
-
-
+# Normalize a single slice (kept for backward compatibility)
 def normalize_slice(slice_data):
-    # Clip data to 0.5–99.5 percentile
     lower, upper = np.percentile(slice_data, [0.5, 99.5])
     slice_clipped = np.clip(slice_data, lower, upper)
-    # Normalize all values to be between [0, 1]
-    normalized = (slice_clipped - lower) / (
-        upper - lower + 1e-8
-    )  # prevent divion by zero
+    normalized = (slice_clipped - lower) / (upper - lower + 1e-8)
     return normalized
 
 
-## Load data
-# file_idx = np.loadtxt('./access.txt')
-# age = np.loadtxt('./age.txt')
-H = W = 192  # all 2D slices resized to 192x192
+# Old MRIDataset class removed - using MRIAgeDataset instead
 
 
+class MRIAgeDataset(Dataset):
+    """Custom dataset class that works with preprocessed tensors and ages"""
+
+    def __init__(self, data_tensors, ages):
+        self.data = data_tensors
+        self.ages = ages
+
+    def __len__(self):
+        return len(self.ages)
+
+    def __getitem__(self, idx):
+        img = self.data[idx]
+        age = torch.tensor([self.ages[idx]], dtype=torch.float32)
+        return img, age
+
+
+# Reparameterization trick
+def reparameterize(mu, logvar):
+    std = torch.exp(0.5 * logvar)
+    eps = torch.randn_like(std)
+    return mu + eps * std
+
+
+# Encoder module
+class Encoder(nn.Module):
+    def __init__(self, latent_dim=16, ft_bank_baseline=16, dropout_alpha=0.5):
+        super().__init__()
+        self.conv1 = nn.Conv2d(1, ft_bank_baseline, kernel_size=3, padding=1)
+        self.pool = nn.MaxPool2d(2)
+        self.conv2 = nn.Conv2d(ft_bank_baseline, ft_bank_baseline * 2, 3, padding=1)
+        self.conv3 = nn.Conv2d(ft_bank_baseline * 2, ft_bank_baseline * 4, 3, padding=1)
+        self.flatten_size = (192 // 8) * (192 // 8) * ft_bank_baseline * 4
+
+        self.dropout = nn.Dropout(dropout_alpha)
+        self.flatten = nn.Flatten()
+        self.fc1 = nn.Linear(self.flatten_size, latent_dim * 4)
+        self.fc_z_mean = nn.Linear(latent_dim * 4, latent_dim)
+        self.fc_z_log_var = nn.Linear(latent_dim * 4, latent_dim)
+
+        self.fc_r_mean = nn.Linear(latent_dim * 4, 1)
+        self.fc_r_log_var = nn.Linear(latent_dim * 4, 1)
+
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = self.pool(x)
+        x = F.relu(self.conv2(x))
+        x = self.pool(x)
+        x = F.relu(self.conv3(x))
+        x = self.pool(x)
+        x = self.flatten(x)
+        x = self.dropout(x)
+        x = torch.tanh(self.fc1(x))
+
+        z_mean = self.fc_z_mean(x)
+        z_log_var = self.fc_z_log_var(x)
+        r_mean = self.fc_r_mean(x)
+        r_log_var = self.fc_r_log_var(x)
+
+        z = reparameterize(z_mean, z_log_var)
+        r = reparameterize(r_mean, r_log_var)
+        return z_mean, z_log_var, z, r_mean, r_log_var, r
+
+
+# Generator module (generates latent distribution parameters from age)
+class Generator(nn.Module):
+    def __init__(self, latent_dim=16):
+        super().__init__()
+        self.pz_mean = nn.Linear(1, latent_dim)
+        self.pz_log_var = nn.Linear(1, 1)
+
+    def forward(self, r):
+        pz_mean = self.pz_mean(r)
+        pz_log_var = self.pz_log_var(r)
+        return pz_mean, pz_log_var
+
+
+# Decoder module (decodes latent z to image)
+class Decoder(nn.Module):
+    def __init__(self, latent_dim=16, ft_bank_baseline=16):
+        super().__init__()
+        self.latent_dim = latent_dim
+        self.ft_bank_baseline = ft_bank_baseline
+
+        downsampled_H = 192 // 8
+        downsampled_W = 192 // 8
+        self.flattened_size = downsampled_H * downsampled_W * ft_bank_baseline * 4
+
+        self.fc1 = nn.Linear(latent_dim, latent_dim * 2)
+        self.fc2 = nn.Linear(latent_dim * 2, latent_dim * 4)
+        self.fc3 = nn.Linear(latent_dim * 4, self.flattened_size)
+
+        self.conv1 = nn.Conv2d(ft_bank_baseline * 4, ft_bank_baseline * 4, 3, padding=1)
+        self.conv2 = nn.Conv2d(ft_bank_baseline * 4, ft_bank_baseline * 2, 3, padding=1)
+        self.conv3 = nn.Conv2d(ft_bank_baseline * 2, ft_bank_baseline, 3, padding=1)
+        self.conv4 = nn.Conv2d(ft_bank_baseline, 1, 3, padding=1)
+
+        self.upsample = nn.Upsample(scale_factor=2)
+
+    def forward(self, z):
+        x = torch.tanh(self.fc1(z))
+        x = torch.tanh(self.fc2(x))
+        x = F.relu(self.fc3(x))
+        x = x.view(-1, self.ft_bank_baseline * 4, 192 // 8, 192 // 8)
+
+        x = F.relu(self.conv1(x))
+        x = self.upsample(x)
+        x = F.relu(self.conv2(x))
+        x = self.upsample(x)
+        x = F.relu(self.conv3(x))
+        x = self.upsample(x)
+        x = self.conv4(x)
+        # No activation if not binary image (can add sigmoid if needed)
+        return x
+
+
+# Loss function combining reconstruction, KL, and label (age) loss
+def vae_loss_fn(
+    x, x_recon, z_mean, z_log_var, pz_mean, pz_log_var, r_mean, r_log_var, r
+):
+    # Reconstruction loss (MAE)
+    recon_loss = F.l1_loss(x_recon, x, reduction="mean")
+
+    # KL divergence between posterior z and prior pz
+    kl_loss = (
+        1
+        + z_log_var
+        - pz_log_var
+        - ((z_mean - pz_mean).pow(2) / pz_log_var.exp())
+        - (z_log_var.exp() / pz_log_var.exp())
+    )
+    kl_loss = -0.5 * kl_loss.sum(dim=1).mean()
+
+    # Label loss (age prediction)
+    label_loss = 0.5 * ((r_mean - r).pow(2) / r_log_var.exp()) + 0.5 * r_log_var
+    label_loss = label_loss.mean()
+
+    return recon_loss + kl_loss + label_loss
+
+
+# Augmentation functions removed - no data augmentation used
+
+
+# Loading all data (same logic as TF version)
 def get_ages(sub_id, dataset_num):
     sub_id = int(sub_id)
     if dataset_num == 1:
-        df = pd.read_csv("/projectnb/ace-ig/ABIDE/Phenotypic_V1_0b.csv")
+        df = pd.read_csv(ABIDE_PATH / "Phenotypic_V1_0b.csv")
         age = df[(df["SUB_ID"] == sub_id)]["AGE_AT_SCAN"].values[0]
         if age > 21:
             return None
     elif dataset_num == 2:
         df = pd.read_csv(
-            "/projectnb/ace-ig/ABIDE/ABIDEII_Composite_Phenotypic.csv",
-            encoding="cp1252",
+            ABIDE_PATH / "ABIDEII_Composite_Phenotypic.csv", encoding="cp1252"
         )
-        if df[(df["SUB_ID"] == sub_id)].empty:
-            # print(f"[Warning] Subject {sub_id} not found in ABIDE 2 = Longitudinal Subject")
+        if df[(df["SUB_ID"] == sub_id)].empty:  #
             return None
-        age = df[(df["SUB_ID"] == sub_id)]["AGE_AT_SCAN "].values[
-            0
-        ]  # key has extra space at end for ABIDE II
+        age = df[(df["SUB_ID"] == sub_id)]["AGE_AT_SCAN "].values[0]  # note extra space
         if age > 21:
             return None
-
-    # print(f"Subject {sub_id} Age: {age}")
     return age
 
 
-folder_paths = [
-    "/projectnb/ace-ig/ABIDE/ABIDE_I_2D/axial",
-    # "/projectnb/ace-ig/ABIDE/ABIDE_I_2D/coronal",
-    # "/projectnb/ace-ig/ABIDE/ABIDE_I_2D/sagittal",
-    # "/projectnb/ace-ig/ABIDE/ABIDE_II_2D/axial",
-    # "/projectnb/ace-ig/ABIDE/ABIDE_II_2D/coronal",
-    # "/projectnb/ace-ig/ABIDE/ABIDE_II_2D/sagittal"
-]
-image_list = []
-age_list = []
-for folder_path in folder_paths:
-    print(f"Processing folder: {folder_path}")
-    for filename in os.listdir(folder_path):
-        if filename.endswith(".png"):
-            # add subject's age
-            subject_id = filename[2:7]
-            dataset_num = 1 if "ABIDE_I_2D" in folder_path else 2
-            age = get_ages(subject_id, dataset_num)
-            if age is None:
-                continue  # skip adding data if subject is not found in the appropriate dataset or age is above 21
-            age_list.append(age)
+def prepare_data_dicts():
+    """Prepare data dictionaries for MONAI CacheDataset"""
+    folder_paths = [
+        ABIDE_I_2D_REGRESSION / "axial",
+        ABIDE_II_2D_REGRESSION / "axial",
+    ]
 
-            # add subject's scan
-            img_path = os.path.join(folder_path, filename)
-            img = Image.open(img_path).convert("L")  # convert to grayscale
-            img = img.resize(
-                (192, 192)
-            )  # Resize all images to 192x192 so output will match input perfectly after layers
-            img = np.array(img)
-            img = normalize_slice(img)
-            image_list.append(img)
+    data_dicts = []
 
-data = np.expand_dims(np.array(image_list), axis=-1)
-ages = np.array(
-    age_list
-)  # order of data (subjects' scans) should correlate with their ages
+    for folder_path in folder_paths:
+        if not folder_path.exists():
+            print(f"Warning: Folder {folder_path} does not exist, skipping...")
+            continue
 
-## Cross Validation
-print("Data size: ", data.shape)  # e.g. (num_subjects, 192, 192, 1)
+        print(f"Scanning folder: {folder_path}")
+        for filename in os.listdir(folder_path):
+            if filename.endswith(".png"):
+                subject_id = filename[2:7]
+                dataset_num = 1 if "ABIDE_I_2D" in str(folder_path) else 2
+                age = get_ages(subject_id, dataset_num)
 
-skf = StratifiedKFold(n_splits=5, shuffle=True)
-fake = np.zeros((data.shape[0]))
-pred = np.zeros((ages.shape))
+                if age is None:
+                    continue
 
-for train_idx, test_idx in skf.split(data, fake):
+                img_path = str(folder_path / filename)
 
-    train_data = data[train_idx]
-    train_age = ages[train_idx]
+                data_dicts.append(
+                    {
+                        "image": img_path,
+                        "age": float(age),
+                        "subject_id": subject_id,
+                        "dataset_num": dataset_num,
+                    }
+                )
 
-    test_data = data[test_idx]
-    test_age = ages[test_idx]
+    print(f"Found {len(data_dicts)} valid samples")
+    return data_dicts
 
-    # build encoder model
-    input_r = Input(shape=(1,), name="ground_truth")
-    input_image = Input(shape=(H, W, 1), name="input_image")
-    feature = Conv2D(
-        ft_bank_baseline, activation="relu", kernel_size=(3, 3), padding="same"
-    )(input_image)
-    feature = MaxPooling2D(pool_size=(2, 2))(feature)
 
-    feature = Conv2D(
-        ft_bank_baseline * 2, activation="relu", kernel_size=(3, 3), padding="same"
-    )(feature)
-    feature = MaxPooling2D(pool_size=(2, 2))(feature)
+def create_monai_dataset(cache_rate=1.0, num_workers=4):
+    """Create MONAI CacheDataset for data loading"""
 
-    feature = Conv2D(
-        ft_bank_baseline * 4, activation="relu", kernel_size=(3, 3), padding="same"
-    )(feature)
-    feature = MaxPooling2D(pool_size=(2, 2))(feature)
+    # Prepare data dictionaries
+    data_dicts = prepare_data_dicts()
 
-    feature = Flatten()(feature)
-    feature = Dropout(dropout_alpha)(feature)
-    feature_dense = Dense(
-        latent_dim * 4, activation="tanh", kernel_regularizer=regularizers.l2(L2_reg)
-    )(feature)
+    if len(data_dicts) == 0:
+        raise ValueError("No valid data found!")
 
-    feature_z_mean = Dense(latent_dim * 2, activation="tanh")(feature_dense)
-    z_mean = Dense(latent_dim, name="z_mean")(feature_z_mean)
-    feature_z_log_var = Dense(latent_dim * 2, activation="tanh")(feature_dense)
-    z_log_var = Dense(latent_dim, name="z_log_var")(feature_z_log_var)
-
-    feature_r_mean = Dense(latent_dim * 2, activation="tanh")(feature_dense)
-    r_mean = Dense(1, name="r_mean")(feature_r_mean)
-    feature_r_log_var = Dense(latent_dim * 2, activation="tanh")(feature_dense)
-    r_log_var = Dense(1, name="r_log_var")(feature_r_log_var)
-
-    # use reparameterization trick to push the sampling out as input
-    z = Lambda(sampling, output_shape=(latent_dim,), name="z")([z_mean, z_log_var])
-    r = Lambda(sampling, output_shape=(1,), name="r")([r_mean, r_log_var])
-
-    # instantiate encoder model
-    encoder = Model(
-        [input_image], [z_mean, z_log_var, z, r_mean, r_log_var, r], name="encoder"
+    # Create single cache dataset (no augmentation)
+    print("Creating MONAI CacheDataset...")
+    cached_ds = CacheDataset(
+        data=data_dicts,
+        transform=data_transforms,
+        cache_rate=cache_rate,
+        num_workers=num_workers,
+        progress=True,
     )
-    # encoder = Model([input_image, input_r], [z_mean, z_log_var, z, r_mean, r_log_var, r], name='encoder') = old code with inputs not connected to outputs error due to input_r?
-    encoder.summary()
 
-    # build generator model
-    generator_input = Input(shape=(1,), name="generator_input")
-    # inter_z_1 = Dense(int(latent_dim/4), activation='tanh', kernel_constraint=unit_norm(), name='inter_z_1')(generator_input)
-    # inter_z_2 = Dense(int(latent_dim/2), activation='tanh', kernel_constraint=unit_norm(), name='inter_z_2')(inter_z_1)
-    # pz_mean = Dense(latent_dim, name='pz_mean')(inter_z_2)
-    pz_mean = Dense(latent_dim, name="pz_mean", kernel_constraint=unit_norm())(
-        generator_input
+    return cached_ds
+
+
+def extract_tensors_and_ages(cached_dataset):
+    """Extract preprocessed tensors and ages from cached dataset"""
+    print("Extracting preprocessed data from cache...")
+
+    images = []
+    ages = []
+
+    for i in tqdm(range(len(cached_dataset)), desc="Extracting cached data"):
+        sample = cached_dataset[i]
+        images.append(sample["image"])
+        ages.append(sample["age"])
+
+    return torch.stack(images), np.array(ages)
+
+
+def load_data_with_monai_cache(cache_rate=1.0, num_workers=4):
+    """Load data using MONAI CacheDataset for optimal performance"""
+
+    # Create cached dataset
+    cached_ds = create_monai_dataset(cache_rate, num_workers)
+
+    # Extract preprocessed tensors and ages
+    data_tensors, ages = extract_tensors_and_ages(cached_ds)
+
+    # Return in the format expected by the rest of the code
+    return data_tensors.numpy(), ages
+
+
+def load_data():
+    """Main data loading function - uses MONAI CacheDataset for optimal speed"""
+    return load_data_with_monai_cache()
+
+
+def save_image_tensor(img_tensor, filename):
+    # img_tensor shape: (1, H, W)
+    img_np = img_tensor.squeeze().cpu().numpy()
+    img_np = np.clip(img_np, 0, 1)
+    img_np = (img_np * 255).astype(np.uint8)
+    img = Image.fromarray(img_np)
+    img.save(filename)
+
+
+def log_vae_images(writer, inputs, reconstructions, ages, epoch, prefix=""):
+    """
+    Log VAE input and reconstruction images to TensorBoard with age info
+    """
+    sample_idx = 0
+
+    # Get first sample
+    input_img = inputs[sample_idx : sample_idx + 1]  # (1, 1, H, W)
+    recon_img = reconstructions[sample_idx : sample_idx + 1]  # (1, 1, H, W)
+    age = ages[sample_idx].item()
+
+    # Create figure with 2 subplots
+    fig, axes = plt.subplots(1, 2, figsize=(8, 4))
+
+    # Input image
+    axes[0].imshow(input_img.squeeze().cpu().numpy(), cmap="gray")
+    axes[0].set_title(f"Input (Age: {age:.1f})")
+    axes[0].axis("off")
+
+    # Reconstruction
+    axes[1].imshow(recon_img.squeeze().cpu().numpy(), cmap="gray")
+    axes[1].set_title("VAE Reconstruction")
+    axes[1].axis("off")
+
+    plt.tight_layout()
+
+    title = (
+        f"{prefix}_VAE_Images_epoch_{epoch}" if prefix else f"VAE_Images_epoch_{epoch}"
     )
-    pz_log_var = Dense(1, name="pz_log_var", kernel_constraint=max_norm(0))(
-        generator_input
+    writer.add_figure(title, fig, epoch)
+    plt.close(fig)
+
+
+# Training function per fold with TensorBoard logging
+def train_fold(train_loader, val_loader, model, epochs, lr=1e-3, hparams=None):
+    from models.vae import vae_loss_function
+
+    model.train()
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+
+    # Setup TensorBoard writer
+    log_dir = "/projectnb/ace-genetics/jueqiw/experiment/Autism_Brain_Development/experiments/tensorboard"
+    if hparams and hasattr(hparams, "experiment_name"):
+        log_dir = os.path.join(log_dir, f"{hparams.experiment_name}_fold")
+    writer = SummaryWriter(log_dir=log_dir)
+
+    train_loss_history = []
+    val_loss_history = []
+
+    for epoch in range(epochs):
+        # Training
+        total_train_loss = 0
+        total_recon_loss = 0
+        total_kl_loss = 0
+        total_age_loss = 0
+
+        train_sample_for_logging = None
+
+        for batch_idx, (imgs, ages) in enumerate(train_loader):
+            imgs = imgs.to(device)
+            ages = ages.to(device)
+
+            optimizer.zero_grad()
+
+            # Forward pass through VAE
+            (
+                recon,
+                z_mean,
+                z_logvar,
+                pz_mean,
+                pz_logvar,
+                age_mean,
+                age_logvar,
+                age_pred,
+            ) = model(imgs, ages)
+
+            # Compute VAE loss (using dummy targets for reconstruction since this is generative)
+            total_loss, recon_loss, kl_loss, age_loss = vae_loss_function(
+                recon,
+                imgs,
+                imgs,  # Use input as target for reconstruction
+                z_mean,
+                z_logvar,
+                pz_mean,
+                pz_logvar,
+                age_mean,
+                age_logvar,
+                age_pred,
+                ages,
+            )
+
+            total_loss.backward()
+            optimizer.step()
+
+            total_train_loss += total_loss.item()
+            total_recon_loss += recon_loss.item()
+            total_kl_loss += kl_loss.item()
+            total_age_loss += age_loss.item()
+
+            # Store sample for logging
+            if batch_idx == 0 and (epoch + 1) % 10 == 0:
+                train_sample_for_logging = (
+                    imgs[:4].detach().cpu(),
+                    recon[:4].detach().cpu(),
+                    ages[:4].detach().cpu(),
+                )
+
+        avg_train_loss = total_train_loss / len(train_loader)
+        avg_recon_loss = total_recon_loss / len(train_loader)
+        avg_kl_loss = total_kl_loss / len(train_loader)
+        avg_age_loss = total_age_loss / len(train_loader)
+
+        train_loss_history.append(avg_train_loss)
+
+        # Log training losses
+        writer.add_scalar("Loss/Train_Total", avg_train_loss, epoch)
+        writer.add_scalar("Loss/Train_Reconstruction", avg_recon_loss, epoch)
+        writer.add_scalar("Loss/Train_KL", avg_kl_loss, epoch)
+        writer.add_scalar("Loss/Train_Age", avg_age_loss, epoch)
+
+        # Validation
+        model.eval()
+        total_val_loss = 0
+        sample_inputs = sample_reconstructions = sample_ages = None
+
+        with torch.no_grad():
+            for batch_idx, (imgs_val, ages_val) in enumerate(val_loader):
+                imgs_val = imgs_val.to(device)
+                ages_val = ages_val.to(device)
+
+                (
+                    recon_val,
+                    z_mean_val,
+                    z_logvar_val,
+                    pz_mean_val,
+                    pz_logvar_val,
+                    age_mean_val,
+                    age_logvar_val,
+                    age_pred_val,
+                ) = model(imgs_val, ages_val)
+
+                val_loss, _, _, _ = vae_loss_function(
+                    recon_val,
+                    imgs_val,
+                    imgs_val,
+                    z_mean_val,
+                    z_logvar_val,
+                    pz_mean_val,
+                    pz_logvar_val,
+                    age_mean_val,
+                    age_logvar_val,
+                    age_pred_val,
+                    ages_val,
+                )
+
+                total_val_loss += val_loss.item()
+
+                # Store samples for logging
+                if batch_idx == 0 and (epoch + 1) % 10 == 0:
+                    sample_inputs = imgs_val[:4].detach().cpu()
+                    sample_reconstructions = recon_val[:4].detach().cpu()
+                    sample_ages = ages_val[:4].detach().cpu()
+
+        avg_val_loss = total_val_loss / len(val_loader)
+        val_loss_history.append(avg_val_loss)
+
+        writer.add_scalar("Loss/Validation", avg_val_loss, epoch)
+
+        # Log images every 10 epochs
+        if (epoch + 1) % 10 == 0:
+            if train_sample_for_logging is not None:
+                sample_train_inputs, sample_train_recons, sample_train_ages = (
+                    train_sample_for_logging
+                )
+                log_vae_images(
+                    writer,
+                    sample_train_inputs,
+                    sample_train_recons,
+                    sample_train_ages,
+                    epoch,
+                    prefix="Train",
+                )
+
+            if sample_inputs is not None:
+                log_vae_images(
+                    writer,
+                    sample_inputs,
+                    sample_reconstructions,
+                    sample_ages,
+                    epoch,
+                    prefix="Val",
+                )
+
+            print(
+                f"Epoch {epoch+1}/{epochs} - Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f}"
+            )
+            print(
+                f"  Recon: {avg_recon_loss:.6f} | KL: {avg_kl_loss:.6f} | Age: {avg_age_loss:.6f}"
+            )
+
+        model.train()  # Switch back to training mode
+
+    writer.close()
+    return model
+
+
+# Evaluation function
+def evaluate(val_loader, model):
+    model.eval()
+    preds = []
+    targets = []
+    with torch.no_grad():
+        for imgs, ages in val_loader:
+            imgs = imgs.to(device)
+            ages = ages.to(device)
+            # Get age prediction from VAE
+            _, _, _, age_mean, _, _ = model(imgs, ages)
+            preds.append(age_mean.cpu().numpy())
+            targets.append(ages.cpu().numpy())
+    preds = np.concatenate(preds).squeeze()
+    targets = np.concatenate(targets).squeeze()
+    mse = mean_squared_error(targets, preds)
+    r2 = r2_score(targets, preds)
+    return preds, targets, mse, r2
+
+
+def main(hparams):
+    data, ages = load_data()
+    print(
+        "Data shape:", data.shape
+    )  # (N, 1, H, W) - already has channel dimension from MONAI
+    print("Ages shape:", ages.shape)
+
+    # Data is already preprocessed by MONAI transforms
+    ages = ages.astype(np.float32)
+
+    # For cross-validation, we'll create datasets manually
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+    fake_strat = np.zeros(len(ages))
+    preds_all = np.zeros(len(ages))
+
+    for fold, (train_idx, val_idx) in enumerate(skf.split(data, fake_strat)):
+        print(f"Fold {fold+1}")
+
+        # Create datasets using the preprocessed data (no augmentation)
+        train_dataset = MRIAgeDataset(data[train_idx], ages[train_idx])
+        val_dataset = MRIAgeDataset(data[val_idx], ages[val_idx])
+
+        train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
+
+        model = create_vae_model(
+            hparams,
+            pretrained_path=PRE_TRAINED_WEIGHTS
+            / "all_model_monai_l1_autoencoder_diff_init_bs_8_heavily_weighted_loss_without_outside_brain_.pt",
+        ).to(device)
+
+        model = train_fold(train_loader, val_loader, model, epochs=1, hparams=hparams)
+
+        preds, targets, mse, r2 = evaluate(val_loader, model)
+        print(f"Validation MSE: {mse:.4f}, R2: {r2:.4f}")
+        preds_all[val_idx] = preds
+
+        # Save VAE model weights
+        os.makedirs("torch_weights/vae_weights", exist_ok=True)
+        torch.save(model.state_dict(), f"torch_weights/vae_weights/vae_fold_{fold}.pt")
+        break
+
+    print("Cross-Validation MSE:", mean_squared_error(ages, preds_all))
+    print("Cross-Validation R2:", r2_score(ages, preds_all))
+
+    # Train on all data now to get final model
+    print("Training on full dataset...")
+    full_dataset = MRIAgeDataset(data, ages)
+    full_loader = DataLoader(full_dataset, batch_size=64, shuffle=True)
+    model = create_vae_model(
+        hparams,
+        pretrained_path=PRE_TRAINED_WEIGHTS
+        / "all_model_monai_l1_autoencoder_diff_init_bs_8_heavily_weighted_loss_without_outside_brain_.pt",
+    ).to(device)
+
+    # Train the final VAE model on full dataset
+    final_model = train_fold(
+        full_loader, full_loader, model, epochs=80, hparams=hparams
     )
-    # instantiate generator model
-    generator = Model(generator_input, [pz_mean, pz_log_var], name="generator")
-    generator.summary()
 
-    # build decoder model
-    latent_input = Input(shape=(latent_dim,), name="z_sampling")
-    decoded = Dense(
-        latent_dim * 2, activation="tanh", kernel_regularizer=regularizers.l2(L2_reg)
-    )(latent_input)
-    decoded = Dense(
-        latent_dim * 4, activation="tanh", kernel_regularizer=regularizers.l2(L2_reg)
-    )(decoded)
-    # After 3 poolings (each /2), H and W go from 192 → 96 → 48 → 24
-    downsampled_H = H // 8
-    downsampled_W = W // 8
-    flattened_size = downsampled_H * downsampled_W * ft_bank_baseline * 4
-    decoded = Dense(
-        flattened_size, activation="relu", kernel_regularizer=regularizers.l2(L2_reg)
-    )(decoded)
-    decoded = Reshape((downsampled_H, downsampled_W, ft_bank_baseline * 4))(decoded)
+    # Save final VAE model
+    os.makedirs("torch_weights/vae_weights", exist_ok=True)
+    torch.save(final_model.state_dict(), "torch_weights/vae_weights/vae_final.pt")
 
-    decoded = Conv2D(ft_bank_baseline * 4, kernel_size=(3, 3), padding="same")(decoded)
-    decoded = Activation("relu")(decoded)
-    decoded = UpSampling2D((2, 2))(decoded)
+    # Generate samples from VAE given age points
+    final_model.eval()
+    age_points = (
+        torch.tensor([8.0, 10.0, 12.0, 14.0, 16.0, 18.0, 20.0], dtype=torch.float32)
+        .unsqueeze(1)
+        .to(device)
+    )
 
-    decoded = Conv2D(ft_bank_baseline * 2, kernel_size=(3, 3), padding="same")(decoded)
-    decoded = Activation("relu")(decoded)
-    decoded = UpSampling2D((2, 2))(decoded)
+    os.makedirs("torch_generations_vae/axial_generations", exist_ok=True)
 
-    decoded = Conv2D(ft_bank_baseline, kernel_size=(3, 3), padding="same")(decoded)
-    decoded = Activation("relu")(decoded)
-    decoded = UpSampling2D((2, 2))(decoded)
+    with torch.no_grad():
+        # Generate age-dependent priors and sample from them
+        pz_mean, pz_logvar = final_model.age_to_prior(age_points)
 
-    decoded = Conv2D(1, kernel_size=(3, 3), padding="same")(decoded)
-    if binary_image:
-        outputs = Activation("sigmoid")(decoded)
-    else:
-        outputs = decoded
-
-    # instantiate decoder model
-    decoder = Model(latent_input, outputs, name="decoder")
-    decoder.summary()
-
-    # instantiate VAE model
-    # 2 lines of old code commented out below?
-    # pz_mean,pz_log_var = generator(encoder([input_image,input_r])[5])
-    # outputs = decoder(encoder([input_image,input_r])[2])
-    pz_mean, pz_log_var = generator(encoder([input_image])[5])
-    outputs = decoder(encoder([input_image])[2])
-    # vae = Model([input_image,input_r], [outputs, pz_mean,pz_log_var], name='vae_mlp')
-    vae = Model([input_image], [outputs, pz_mean, pz_log_var], name="vae_mlp")
-
-    if binary_image:
-        reconstruction_loss = K.mean(
-            binary_crossentropy(input_image, outputs), axis=[1, 2, 3]
+        # Sample from the age-conditioned latent space
+        z_samples = (
+            final_model.reparameterize(pz_mean, pz_logvar)
+            if hasattr(final_model, "reparameterize")
+            else pz_mean
         )
-    else:
-        reconstruction_loss = K.mean(
-            mean_absolute_error(input_image, outputs), axis=[1, 2, 3]
+
+        # Decode to images
+        generated_images = final_model.decode(z_samples)
+
+    for i, age in enumerate(age_points.squeeze().cpu().numpy()):
+        img = generated_images[i]
+        save_image_tensor(
+            img, f"torch_generations_vae/axial_generations/generated_age_{age:.1f}.png"
         )
 
-    kl_loss = (
-        1
-        + z_log_var
-        - pz_log_var
-        - K.square(z_mean - pz_mean) / K.exp(pz_log_var)
-        - K.exp(z_log_var) / K.exp(pz_log_var)
-    )
-    kl_loss = -0.5 * K.sum(kl_loss, axis=-1)
-    label_loss = 0.5 * K.square(r_mean - input_r) / K.exp(r_log_var) + 0.5 * r_log_var
 
-    vae_loss = K.mean(reconstruction_loss + kl_loss + label_loss)
-
-    vae.add_loss(vae_loss)
-    vae.compile(optimizer="adam")
-    vae.summary()
-
-"""
-    #break
-    # augment data
-    train_data_aug,train_age_aug = augment_by_transformation(train_data,train_age,augment_size)
-    print("Train data shape: ",train_data_aug.shape)
-
-    # training
-    vae.fit([train_data_aug,train_age_aug],
-            verbose=2,
-            batch_size=64,
-            epochs = 80)
-
-    vae.save_weights('vae_weights.h5')
-    encoder.save_weights('encoder_weights.h5')
-    generator.save_weights('generator_weights.h5')
-    decoder.save_weights('decoder_weights.h5')
-
-    # testing
-    [z_mean, z_log_var, z, r_mean, r_log_var, r_vae] = encoder.predict([test_data,test_age],batch_size=64)
-    pred[test_idx] = r_mean[:,0]
-
-    filename = 'prediction_'+str(dropout_alpha)+'_'+str(L2_reg)+'.npy'
-    np.save(filename,pred)
-
-## CC accuracy
-print("MSE: ", mean_squared_error(age,pred))
-print("R2: ", r2_score(age, pred))
-
-exit()
-
-## Training on all data to learn a mega generative model
-train_data_aug,train_age_aug = augment_by_transformation(data,age,augment_size)
-vae.fit([data,age],
-        verbose=2,
-        batch_size=64,
-        epochs = 80)
-
-## Sample from latent space for visualizing the aging brain
-#generator.load_weights('generator_weights.h5')
-#decoder.load_weights('decoder_weights.h5')
-# this range depends on the resulting encoded latent space
-r = [-2, -1.5, -1, -0.5, 0, 1, 1.5, 2.5, 3.5, 4.5]
-
-pz_mean = generator.predict(r,batch_size=64)
-outputs = decoder.predict(pz_mean,batch_size=64)
-
-for i in range(0,10):   
-    array_img = nib.Nifti1Image(np.squeeze(outputs[i,:,:,:,0]),np.diag([1, 1, 1, 1]))
-    
-    filename = 'generated'+str(i)+'.nii.gz'
-    nib.save(array_img,filename)
-
-exit() """
+if __name__ == "__main__":
+    parser = ArgumentParser(description="Trainer args", add_help=False)
+    add_argument(parser)
+    main(parser.parse_args())
+    main()

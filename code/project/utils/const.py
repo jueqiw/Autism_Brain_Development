@@ -1,6 +1,13 @@
 import os
 from pathlib import Path
 
+
+ABIDE_PATH = Path("/projectnb/ace-ig/ABIDE/").resolve()
+ABIDE_I_2D_REGRESSION = Path("/projectnb/ace-ig/ABIDE/ABIDE_I_2D").resolve()
+ABIDE_II_2D_REGRESSION = Path("/projectnb/ace-ig/ABIDE/ABIDE_II_2D").resolve()
+PRE_TRAINED_WEIGHTS = Path("/projectnb/ace-genetics/jueqiw/experiment/Autism_Brain_Development/pretrain_weight").resolve()
+
+
 ABIDE_I_transform = Path("/projectnb/ace-genetics/ABIDE/ABIDE_I").resolve()
 ABIDE_II_transform = Path("/projectnb/ace-genetics/ABIDE/ABIDE_II").resolve()
 ABIDE_I_MNI = Path("/projectnb/ace-ig/ABIDE/ABIDE_I_BIDS/derivatives/MNI/").resolve()
@@ -57,18 +64,3 @@ ACE_GENO_FILE = "/projectnb/ace-ig/jueqiw/dataset/ACE/genetics/prs_analysis/data
 ACE_IMG_FILE_DESTRIEUX = "/projectnb/ace-ig/jueqiw/dataset/ACE/mri/freesurfer/group_stats/sMRI_destrieux_cortical_thickness_average.csv"
 ACE_IMG_FILE_BRAINNETOME = "/projectnb/ace-ig/jueqiw/dataset/ACE/mri/freesurfer/group_stats/ACE_img_Brainnetome.csv"
 ACE_IMG_GENO_FOLDER = Path("/project/ace-ig/jueqiw/data/ACE/joint")
-
-# +-----------------+
-# | ACE paired path |
-# +-----------------+
-ACE_PAIRED_FOLDER = Path(
-    "/projectnb/ace-ig/jueqiw/dataset/ACE/genetics/prs_analysis/data/GMIND_new/pair_train_val_test"
-)
-
-# +------------+
-# | SSC Folder |
-# +------------+
-SSC_FOLDER = Path("/project/ace-ig/jueqiw/data/SSC/")
-ACE_IMG_GENE_INNER = Path(
-    "/projectnb/ace-ig/jueqiw/dataset/ACE/genetics/prs_analysis/data/ACE/GMIND/ACE_img_Brainnetome_geno_inner.csv"
-)

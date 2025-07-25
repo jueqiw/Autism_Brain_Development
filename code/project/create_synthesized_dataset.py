@@ -7,7 +7,11 @@ import disptools.displacements as dsp
 import numpy as np
 from matplotlib import pyplot as plt
 
-from utils.utils import get_ABIDE_I_subject, get_ABIDE_II_subject, create_training_samples
+from utils.utils import (
+    get_ABIDE_I_subject,
+    get_ABIDE_II_subject,
+    create_training_samples,
+)
 from utils.const import ABIDE_I_MNI, ABIDE_II_MNI
 
 
@@ -46,7 +50,6 @@ if __name__ == "__main__":
         # save the subjects for this job
         with open(os.path.join(job_dir, "subjects.pkl"), "wb") as f:
             pickle.dump(job_subjects, f)
-
 
     atlas = sitk.ReadImage(
         "/projectnb/ace-genetics/jueqiw/dataset/MRI_template/Atlas/BN_Atlas_246_space-MNI152NLin2009cAsym.nii.gz"

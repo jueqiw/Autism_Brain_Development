@@ -8,7 +8,13 @@
 #$ mem_per_core=4G
 
 module load python3/3.8.10
-export PYTHONPATH=/projectnb/ace-ig/jw_python/lib/python3.8.10/site-packages:$PYTHONPATH
 module load pytorch/1.13.1
 
-python3 /project/ace-ig/jueqiw/code/Autism_Brain_Development/code/project/create_2D_image.py
+source /projectnb/ace-genetics/jueqiw/software/venvs/monai/bin/activate
+python3 /project/ace-genetics/jueqiw/code/Autism_Brain_Development/code/project/weighted_l1_all_monai_autoencoder.py \
+    --loss_type simple_l1 \
+    --weight_clamp_max 20.0 \
+    --experiment_name "simple_l1_weight_clamp_max_20.0" \
+    --batch_size 64
+
+python3 /project/ace-ig/jueqiw/code/Autism_Brain_Development/code/project/create_2D_image.py --batch_size 64

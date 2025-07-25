@@ -55,40 +55,72 @@ if __name__ == "__main__":
     n_epochs = 1
 
     # make folder structure
-    ABIDE_2D = Path(f"/projectnb/ace-genetics/ABIDE/ABIDE_{dataset_name}_2D_Syn_pretrained")
+    ABIDE_2D = Path(
+        f"/projectnb/ace-genetics/ABIDE/ABIDE_{dataset_name}_2D_Syn_pretrained"
+    )
     ABIDE_2D.mkdir(parents=True, exist_ok=True)
-    sagittal_dir = Path(f"/projectnb/ace-genetics/ABIDE/ABIDE_{dataset_name}_2D_Syn_pretrained/sagittal")
+    sagittal_dir = Path(
+        f"/projectnb/ace-genetics/ABIDE/ABIDE_{dataset_name}_2D_Syn_pretrained/sagittal"
+    )
     sagittal_dir.mkdir(parents=True, exist_ok=True)
-    coronal_dir = Path(f"/projectnb/ace-genetics/ABIDE/ABIDE_{dataset_name}_2D_Syn_pretrained/coronal")
+    coronal_dir = Path(
+        f"/projectnb/ace-genetics/ABIDE/ABIDE_{dataset_name}_2D_Syn_pretrained/coronal"
+    )
     coronal_dir.mkdir(parents=True, exist_ok=True)
-    axial_dir = Path(f"/projectnb/ace-genetics/ABIDE/ABIDE_{dataset_name}_2D_Syn_pretrained/axial")
+    axial_dir = Path(
+        f"/projectnb/ace-genetics/ABIDE/ABIDE_{dataset_name}_2D_Syn_pretrained/axial"
+    )
     axial_dir.mkdir(parents=True, exist_ok=True)
-    sagittal_original_dir = Path(f"/projectnb/ace-genetics/ABIDE/ABIDE_{dataset_name}_2D_Syn_pretrained/sagittal/original")
+    sagittal_original_dir = Path(
+        f"/projectnb/ace-genetics/ABIDE/ABIDE_{dataset_name}_2D_Syn_pretrained/sagittal/original"
+    )
     sagittal_original_dir.mkdir(parents=True, exist_ok=True)
-    coronal_original_dir = Path(f"/projectnb/ace-genetics/ABIDE/ABIDE_{dataset_name}_2D_Syn_pretrained/coronal/original")
+    coronal_original_dir = Path(
+        f"/projectnb/ace-genetics/ABIDE/ABIDE_{dataset_name}_2D_Syn_pretrained/coronal/original"
+    )
     coronal_original_dir.mkdir(parents=True, exist_ok=True)
-    axial_original_dir = Path(f"/projectnb/ace-genetics/ABIDE/ABIDE_{dataset_name}_2D_Syn_pretrained/axial/original")
+    axial_original_dir = Path(
+        f"/projectnb/ace-genetics/ABIDE/ABIDE_{dataset_name}_2D_Syn_pretrained/axial/original"
+    )
     axial_original_dir.mkdir(parents=True, exist_ok=True)
     # transformed images folder
-    sagittal_transformed_dir = Path(f"/projectnb/ace-genetics/ABIDE/ABIDE_{dataset_name}_2D_Syn_pretrained/sagittal/transformed")
+    sagittal_transformed_dir = Path(
+        f"/projectnb/ace-genetics/ABIDE/ABIDE_{dataset_name}_2D_Syn_pretrained/sagittal/transformed"
+    )
     sagittal_transformed_dir.mkdir(parents=True, exist_ok=True)
-    coronal_transformed_dir = Path(f"/projectnb/ace-genetics/ABIDE/ABIDE_{dataset_name}_2D_Syn_pretrained/coronal/transformed")
+    coronal_transformed_dir = Path(
+        f"/projectnb/ace-genetics/ABIDE/ABIDE_{dataset_name}_2D_Syn_pretrained/coronal/transformed"
+    )
     coronal_transformed_dir.mkdir(parents=True, exist_ok=True)
-    axial_transformed_dir = Path(f"/projectnb/ace-genetics/ABIDE/ABIDE_{dataset_name}_2D_Syn_pretrained/axial/transformed")
+    axial_transformed_dir = Path(
+        f"/projectnb/ace-genetics/ABIDE/ABIDE_{dataset_name}_2D_Syn_pretrained/axial/transformed"
+    )
     axial_transformed_dir.mkdir(parents=True, exist_ok=True)
     # Jacobian images folder
-    sagittal_jacobian_dir = Path(f"/projectnb/ace-genetics/ABIDE/ABIDE_{dataset_name}_2D_Syn_pretrained/sagittal/jacobian")
+    sagittal_jacobian_dir = Path(
+        f"/projectnb/ace-genetics/ABIDE/ABIDE_{dataset_name}_2D_Syn_pretrained/sagittal/jacobian"
+    )
     sagittal_jacobian_dir.mkdir(parents=True, exist_ok=True)
-    coronal_jacobian_dir = Path(f"/projectnb/ace-genetics/ABIDE/ABIDE_{dataset_name}_2D_Syn_pretrained/coronal/jacobian")
+    coronal_jacobian_dir = Path(
+        f"/projectnb/ace-genetics/ABIDE/ABIDE_{dataset_name}_2D_Syn_pretrained/coronal/jacobian"
+    )
     coronal_jacobian_dir.mkdir(parents=True, exist_ok=True)
-    axial_jacobian_dir = Path(f"/projectnb/ace-genetics/ABIDE/ABIDE_{dataset_name}_2D_Syn_pretrained/axial/jacobian")
+    axial_jacobian_dir = Path(
+        f"/projectnb/ace-genetics/ABIDE/ABIDE_{dataset_name}_2D_Syn_pretrained/axial/jacobian"
+    )
     axial_jacobian_dir.mkdir(parents=True, exist_ok=True)
     # Displacement field images folder
-    sagittal_dispfield_dir = Path(f"/projectnb/ace-genetics/ABIDE/ABIDE_{dataset_name}_2D_Syn_pretrained/sagittal/dispfield")
+    sagittal_dispfield_dir = Path(
+        f"/projectnb/ace-genetics/ABIDE/ABIDE_{dataset_name}_2D_Syn_pretrained/sagittal/dispfield"
+    )
     sagittal_dispfield_dir.mkdir(parents=True, exist_ok=True)
-    coronal_dispfield_dir = Path(f"/projectnb/ace-genetics/ABIDE/ABIDE_{dataset_name}_2D_Syn_pretrained/coronal/dispfield")
+    coronal_dispfield_dir = Path(
+        f"/projectnb/ace-genetics/ABIDE/ABIDE_{dataset_name}_2D_Syn_pretrained/coronal/dispfield"
+    )
     coronal_dispfield_dir.mkdir(parents=True, exist_ok=True)
-    axial_dispfield_dir = Path(f"/projectnb/ace-genetics/ABIDE/ABIDE_{dataset_name}_2D_Syn_pretrained/axial/dispfield")
+    axial_dispfield_dir = Path(
+        f"/projectnb/ace-genetics/ABIDE/ABIDE_{dataset_name}_2D_Syn_pretrained/axial/dispfield"
+    )
     axial_dispfield_dir.mkdir(parents=True, exist_ok=True)
     dispfield_img_list = []
 
@@ -120,17 +152,21 @@ if __name__ == "__main__":
             save_images(jacobian_img, "jacobian", train_batch_data, digits)
 
             # save the displacement field images
-            cx, cy, cz = dispfield_img.shape[0] // 2, dispfield_img.shape[1] // 2, dispfield_img.shape[2] // 2
+            cx, cy, cz = (
+                dispfield_img.shape[0] // 2,
+                dispfield_img.shape[1] // 2,
+                dispfield_img.shape[2] // 2,
+            )
             for j in range(-2, 3):
                 # Extract displacement slices and compute magnitude (keep 2D structure)
                 sagittal_slice = dispfield_img[:, cx + j, :, :]
                 coronal_slice = dispfield_img[:, :, cy + j, :]
                 axial_slice = dispfield_img[:, :, :, cz + j]
-                
+
                 # Compute magnitude: sqrt(dx² + dy² + dz²) for each pixel
-                sagittal = np.rot90(sagittal_slice, k=2, axes=(1,2))
-                coronal = np.rot90(coronal_slice, k=2, axes=(1,2))
-                axial = np.rot90(axial_slice, k=1, axes=(1,2))
+                sagittal = np.rot90(sagittal_slice, k=2, axes=(1, 2))
+                coronal = np.rot90(coronal_slice, k=2, axes=(1, 2))
+                axial = np.rot90(axial_slice, k=1, axes=(1, 2))
                 axial = np.flip(axial, axis=2)
 
                 # save to npz file
@@ -149,3 +185,4 @@ if __name__ == "__main__":
                     f"dispfield_{digits}_{j}.npz",
                     axial=axial,
                 )
+

@@ -150,6 +150,7 @@ def get_transformed_train_data_transform() -> Compose:
             SpatialPadd(
                 keys=["img", "mask", "transformed_img", "jacobian", "dispfield"],
                 spatial_size=[196, 196, 196],
+                mode="edge",
             ),
             ScaleIntensityRangePercentilesd(
                 keys=[
@@ -164,23 +165,23 @@ def get_transformed_train_data_transform() -> Compose:
             ),
             RandGaussianNoised(
                 keys=["img"],
-                prob=0.5,
+                prob=0.4,
                 mean=0.0,
                 std=0.08,
             ),
             RandGaussianNoised(
                 keys=["transformed_img"],
-                prob=1,
+                prob=0.4,
                 mean=0.0,
                 std=0.08,
             ),
             RandBiasFieldd(
                 keys=["img"],
-                prob=0.5,
+                prob=0.4,
             ),
             RandBiasFieldd(
                 keys=["transformed_img"],
-                prob=1,
+                prob=0.4,
             ),
         ]
     )
