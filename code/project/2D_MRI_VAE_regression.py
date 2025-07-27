@@ -9,7 +9,6 @@ import numpy as np
 import pandas as pd
 import scipy.ndimage
 from PIL import Image
-from sklearn.model_selection import StratifiedKFold
 from sklearn.metrics import mean_squared_error, r2_score
 import torch
 import torch.nn as nn
@@ -18,13 +17,13 @@ from torch.utils.data import Dataset, DataLoader, Subset
 from torch.utils.tensorboard import SummaryWriter
 from monai.transforms import (
     Compose,
-    LoadImage,
-    EnsureChannelFirst,
-    Resize,
-    ScaleIntensityRange,
-    ToTensor,
+    LoadImaged,
+    EnsureChannelFirstd,
+    Resized,
+    ScaleIntensityRanged,
+    ToTensord,
 )
-from monai.data import CacheDataset
+from monai.data import CacheDataset, partition_dataset
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
@@ -45,16 +44,19 @@ os.environ["MKL_NUM_THREADS"] = "8"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-# MONAI transforms for data preprocessing (no augmentation)
-data_transforms = Compose(
-    [
-        LoadImage(image_only=True),
-        EnsureChannelFirst(),
-        Resize((192, 192)),
-        ScaleIntensityRange(a_min=0.5, a_max=99.5, b_min=0.0, b_max=1.0, clip=True),
-        ToTensor(),
-    ]
-)
+def get_data_transforms():
+    """Create MONAI transforms for data preprocessing with intensity normalization"""
+    return Compose(
+        [
+            LoadImaged(keys=["image"], image_only=True),
+            EnsureChannelFirstd(keys=["image"]),
+            Resized(keys=["image"], spatial_size=(192, 192)),
+            ScaleIntensityRanged(
+                keys=["image"], a_min=0.5, a_max=99.5, b_min=0.0, b_max=1.0, clip=True
+            ),
+            ToTensord(keys=["image"]),
+        ]
+    )
 
 
 # Normalize a single slice (kept for backward compatibility)
@@ -65,22 +67,25 @@ def normalize_slice(slice_data):
     return normalized
 
 
-# Old MRIDataset class removed - using MRIAgeDataset instead
-
-
 class MRIAgeDataset(Dataset):
-    """Custom dataset class that works with preprocessed tensors and ages"""
+    """Custom dataset class that wraps MONAI CacheDataset for training"""
 
-    def __init__(self, data_tensors, ages):
-        self.data = data_tensors
-        self.ages = ages
+    def __init__(self, cached_dataset, indices=None):
+        self.cached_dataset = cached_dataset
+        self.indices = (
+            indices if indices is not None else list(range(len(cached_dataset)))
+        )
 
     def __len__(self):
-        return len(self.ages)
+        return len(self.indices)
 
     def __getitem__(self, idx):
-        img = self.data[idx]
-        age = torch.tensor([self.ages[idx]], dtype=torch.float32)
+        # Get the actual index from the subset
+        actual_idx = self.indices[idx]
+        sample = self.cached_dataset[actual_idx]
+
+        img = sample["image"]  # Already preprocessed tensor
+        age = torch.tensor([sample["age"]], dtype=torch.float32)
         return img, age
 
 
@@ -282,46 +287,13 @@ def create_monai_dataset(cache_rate=1.0, num_workers=4):
     print("Creating MONAI CacheDataset...")
     cached_ds = CacheDataset(
         data=data_dicts,
-        transform=data_transforms,
+        transform=get_data_transforms(),
         cache_rate=cache_rate,
         num_workers=num_workers,
         progress=True,
     )
 
     return cached_ds
-
-
-def extract_tensors_and_ages(cached_dataset):
-    """Extract preprocessed tensors and ages from cached dataset"""
-    print("Extracting preprocessed data from cache...")
-
-    images = []
-    ages = []
-
-    for i in tqdm(range(len(cached_dataset)), desc="Extracting cached data"):
-        sample = cached_dataset[i]
-        images.append(sample["image"])
-        ages.append(sample["age"])
-
-    return torch.stack(images), np.array(ages)
-
-
-def load_data_with_monai_cache(cache_rate=1.0, num_workers=4):
-    """Load data using MONAI CacheDataset for optimal performance"""
-
-    # Create cached dataset
-    cached_ds = create_monai_dataset(cache_rate, num_workers)
-
-    # Extract preprocessed tensors and ages
-    data_tensors, ages = extract_tensors_and_ages(cached_ds)
-
-    # Return in the format expected by the rest of the code
-    return data_tensors.numpy(), ages
-
-
-def load_data():
-    """Main data loading function - uses MONAI CacheDataset for optimal speed"""
-    return load_data_with_monai_cache()
 
 
 def save_image_tensor(img_tensor, filename):
@@ -366,14 +338,249 @@ def log_vae_images(writer, inputs, reconstructions, ages, epoch, prefix=""):
     plt.close(fig)
 
 
-# Training function per fold with TensorBoard logging
-def train_fold(train_loader, val_loader, model, epochs, lr=1e-3, hparams=None):
-    from models.vae import vae_loss_function
-
+# Two-stage training function with warm-up and gradual fine-tuning
+def train_fold_two_stage(
+    train_loader, val_loader, model, epochs, lr=1e-3, hparams=None
+):
+    """
+    Stage 1: Warm-up with frozen encoder (train only VAE heads)
+    Stage 2: Gradual fine-tuning with layer-by-layer unfreezing
+    """
     model.train()
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
 
     # Setup TensorBoard writer
+    log_dir = "/projectnb/ace-genetics/jueqiw/experiment/Autism_Brain_Development/experiments/tensorboard"
+    if hparams and hasattr(hparams, "experiment_name"):
+        log_dir = os.path.join(log_dir, f"{hparams.experiment_name}_two_stage")
+    writer = SummaryWriter(log_dir=log_dir)
+
+    warmup_epochs = epochs // 4  # 25% for warm-up
+    finetune_epochs = epochs - warmup_epochs
+    stage_epochs = finetune_epochs // 3  # Divide fine-tuning into 3 stages
+
+    print(
+        f"Two-stage training: {warmup_epochs} warm-up + {finetune_epochs} fine-tuning epochs"
+    )
+
+    total_train_history = []
+    total_val_history = []
+
+    # ========== STAGE 1: WARM-UP ==========
+    print("Stage 1: Warm-up with frozen encoder...")
+    model.freeze_pretrained_encoder()
+    model.freeze_pretrained_decoder()
+
+    # Use higher LR for new layers only during warm-up
+    param_groups = model.get_parameter_groups(
+        new_lr=lr, pretrained_lr=lr / 10, weight_decay=1e-4
+    )
+    optimizer = torch.optim.Adam(param_groups)
+
+    for epoch in range(warmup_epochs):
+        train_loss, val_loss = train_epoch(
+            train_loader, val_loader, model, optimizer, writer, epoch, "warmup"
+        )
+        total_train_history.append(train_loss)
+        total_val_history.append(val_loss)
+
+        if (epoch + 1) % 10 == 0:
+            print(
+                f"Warm-up Epoch {epoch+1}/{warmup_epochs} - Train: {train_loss:.6f} | Val: {val_loss:.6f}"
+            )
+
+    # ========== STAGE 2: GRADUAL FINE-TUNING ==========
+    print("Stage 2: Gradual fine-tuning...")
+
+    for stage in range(1, 4):  # 3 fine-tuning stages
+        print(f"Fine-tuning stage {stage}/3 - Unfreezing deeper layers...")
+
+        # Gradually unfreeze layers
+        model.unfreeze_encoder_layer_by_layer(stage)
+
+        # Update parameter groups with different LRs and regularization
+        param_groups = model.get_parameter_groups(
+            new_lr=lr * 0.5,  # Lower LR for new layers in fine-tuning
+            pretrained_lr=lr * 0.1,  # Much lower LR for pretrained layers
+            weight_decay=1e-4,  # L2 regularization for pretrained layers
+        )
+        optimizer = torch.optim.Adam(param_groups)
+
+        # Train for this stage
+        stage_start_epoch = warmup_epochs + (stage - 1) * stage_epochs
+        stage_end_epoch = min(warmup_epochs + stage * stage_epochs, epochs)
+
+        for epoch in range(stage_start_epoch, stage_end_epoch):
+            train_loss, val_loss = train_epoch(
+                train_loader,
+                val_loader,
+                model,
+                optimizer,
+                writer,
+                epoch,
+                f"finetune_stage_{stage}",
+            )
+            total_train_history.append(train_loss)
+            total_val_history.append(val_loss)
+
+            if (epoch + 1) % 10 == 0:
+                print(
+                    f"Fine-tune Stage {stage} Epoch {epoch+1-stage_start_epoch+1}/{stage_end_epoch-stage_start_epoch} - Train: {train_loss:.6f} | Val: {val_loss:.6f}"
+                )
+
+    writer.close()
+    return model
+
+
+def train_epoch(train_loader, val_loader, model, optimizer, writer, epoch, stage_name):
+    """Single epoch training and validation"""
+    model.train()
+
+    # Training phase
+    total_train_loss = 0
+    total_recon_loss = 0
+    total_kl_loss = 0
+    total_age_loss = 0
+
+    train_sample_for_logging = None
+
+    for batch_idx, (imgs, ages) in enumerate(train_loader):
+        imgs = imgs.to(device)
+        ages = ages.to(device)
+
+        optimizer.zero_grad()
+
+        # Forward pass through VAE
+        (
+            recon,
+            z_mean,
+            z_logvar,
+            pz_mean,
+            pz_logvar,
+            age_mean,
+            age_logvar,
+            age_pred,
+        ) = model(imgs, ages)
+
+        # Compute VAE loss using local vae_loss_fn
+        total_loss = vae_loss_fn(
+            imgs,
+            recon,
+            z_mean,
+            z_logvar,
+            pz_mean,
+            pz_logvar,
+            age_mean,
+            age_logvar,
+            ages,
+        )
+        recon_loss = kl_loss = age_loss = total_loss  # For logging purposes
+
+        total_loss.backward()
+        optimizer.step()
+
+        total_train_loss += total_loss.item()
+        total_recon_loss += recon_loss.item()
+        total_kl_loss += kl_loss.item()
+        total_age_loss += age_loss.item()
+
+        # Store sample for logging
+        if batch_idx == 0 and (epoch + 1) % 10 == 0:
+            train_sample_for_logging = (
+                imgs[:4].detach().cpu(),
+                recon[:4].detach().cpu(),
+                ages[:4].detach().cpu(),
+            )
+
+    avg_train_loss = total_train_loss / len(train_loader)
+    avg_recon_loss = total_recon_loss / len(train_loader)
+    avg_kl_loss = total_kl_loss / len(train_loader)
+    avg_age_loss = total_age_loss / len(train_loader)
+
+    # Validation phase
+    model.eval()
+    total_val_loss = 0
+    sample_inputs = sample_reconstructions = sample_ages = None
+
+    with torch.no_grad():
+        for batch_idx, (imgs_val, ages_val) in enumerate(val_loader):
+            imgs_val = imgs_val.to(device)
+            ages_val = ages_val.to(device)
+
+            (
+                recon_val,
+                z_mean_val,
+                z_logvar_val,
+                pz_mean_val,
+                pz_logvar_val,
+                age_mean_val,
+                age_logvar_val,
+                age_pred_val,
+            ) = model(imgs_val, ages_val)
+
+            val_loss = vae_loss_fn(
+                imgs_val,
+                recon_val,
+                z_mean_val,
+                z_logvar_val,
+                pz_mean_val,
+                pz_logvar_val,
+                age_mean_val,
+                age_logvar_val,
+                ages_val,
+            )
+            total_val_loss += val_loss.item()
+
+            # Store samples for logging
+            if batch_idx == 0 and (epoch + 1) % 10 == 0:
+                sample_inputs = imgs_val[:4].detach().cpu()
+                sample_reconstructions = recon_val[:4].detach().cpu()
+                sample_ages = ages_val[:4].detach().cpu()
+
+    avg_val_loss = total_val_loss / len(val_loader)
+
+    # Log metrics to TensorBoard
+    writer.add_scalar(f"Loss/{stage_name}_Train_Total", avg_train_loss, epoch)
+    writer.add_scalar(f"Loss/{stage_name}_Train_Reconstruction", avg_recon_loss, epoch)
+    writer.add_scalar(f"Loss/{stage_name}_Train_KL", avg_kl_loss, epoch)
+    writer.add_scalar(f"Loss/{stage_name}_Train_Age", avg_age_loss, epoch)
+    writer.add_scalar(f"Loss/{stage_name}_Validation", avg_val_loss, epoch)
+
+    # Log images every 10 epochs
+    if (epoch + 1) % 10 == 0:
+        if train_sample_for_logging is not None:
+            sample_train_inputs, sample_train_recons, sample_train_ages = (
+                train_sample_for_logging
+            )
+            log_vae_images(
+                writer,
+                sample_train_inputs,
+                sample_train_recons,
+                sample_train_ages,
+                epoch,
+                prefix=f"{stage_name}_Train",
+            )
+
+        if sample_inputs is not None:
+            log_vae_images(
+                writer,
+                sample_inputs,
+                sample_reconstructions,
+                sample_ages,
+                epoch,
+                prefix=f"{stage_name}_Val",
+            )
+
+    return avg_train_loss, avg_val_loss
+
+
+# Original training function (kept for compatibility)
+def train_fold(train_loader, val_loader, model, epochs, lr=1e-3, hparams=None):
+    model.train()
+    # Only optimize parameters that require gradients (trainable parameters)
+    optimizer = torch.optim.Adam(
+        filter(lambda p: p.requires_grad, model.parameters()), lr=lr
+    )
+
     log_dir = "/projectnb/ace-genetics/jueqiw/experiment/Autism_Brain_Development/experiments/tensorboard"
     if hparams and hasattr(hparams, "experiment_name"):
         log_dir = os.path.join(log_dir, f"{hparams.experiment_name}_fold")
@@ -383,21 +590,17 @@ def train_fold(train_loader, val_loader, model, epochs, lr=1e-3, hparams=None):
     val_loss_history = []
 
     for epoch in range(epochs):
-        # Training
         total_train_loss = 0
         total_recon_loss = 0
         total_kl_loss = 0
         total_age_loss = 0
 
         train_sample_for_logging = None
-
         for batch_idx, (imgs, ages) in enumerate(train_loader):
             imgs = imgs.to(device)
             ages = ages.to(device)
 
             optimizer.zero_grad()
-
-            # Forward pass through VAE
             (
                 recon,
                 z_mean,
@@ -409,20 +612,18 @@ def train_fold(train_loader, val_loader, model, epochs, lr=1e-3, hparams=None):
                 age_pred,
             ) = model(imgs, ages)
 
-            # Compute VAE loss (using dummy targets for reconstruction since this is generative)
-            total_loss, recon_loss, kl_loss, age_loss = vae_loss_function(
-                recon,
+            total_loss = vae_loss_fn(
                 imgs,
-                imgs,  # Use input as target for reconstruction
+                recon,
                 z_mean,
                 z_logvar,
                 pz_mean,
                 pz_logvar,
                 age_mean,
                 age_logvar,
-                age_pred,
                 ages,
             )
+            recon_loss = kl_loss = age_loss = total_loss  # For logging purposes
 
             total_loss.backward()
             optimizer.step()
@@ -474,17 +675,15 @@ def train_fold(train_loader, val_loader, model, epochs, lr=1e-3, hparams=None):
                     age_pred_val,
                 ) = model(imgs_val, ages_val)
 
-                val_loss, _, _, _ = vae_loss_function(
+                val_loss = vae_loss_fn(
+                    imgs_val,
                     recon_val,
-                    imgs_val,
-                    imgs_val,
                     z_mean_val,
                     z_logvar_val,
                     pz_mean_val,
                     pz_logvar_val,
                     age_mean_val,
                     age_logvar_val,
-                    age_pred_val,
                     ages_val,
                 )
 
@@ -560,71 +759,58 @@ def evaluate(val_loader, model):
 
 
 def main(hparams):
-    data, ages = load_data()
-    print(
-        "Data shape:", data.shape
-    )  # (N, 1, H, W) - already has channel dimension from MONAI
-    print("Ages shape:", ages.shape)
+    # Load cached dataset directly
+    cached_dataset = create_monai_dataset(cache_rate=0.1, num_workers=8)
+    print(f"Loaded cached dataset with {len(cached_dataset)} samples")
 
-    # Data is already preprocessed by MONAI transforms
-    ages = ages.astype(np.float32)
+    # Split dataset into train/val/test (8:1:1) using MONAI partition_dataset
+    print("Splitting dataset into train/val/test (8:1:1)...")
+    data_partitions = partition_dataset(
+        data=list(range(len(cached_dataset))),
+        ratios=[0.8, 0.1, 0.1],
+        shuffle=True,
+        seed=42,
+    )
 
-    # For cross-validation, we'll create datasets manually
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
-    fake_strat = np.zeros(len(ages))
-    preds_all = np.zeros(len(ages))
+    train_indices, val_indices, test_indices = data_partitions
+    print(f"Train samples: {len(train_indices)}")
+    print(f"Validation samples: {len(val_indices)}")
+    print(f"Test samples: {len(test_indices)}")
 
-    for fold, (train_idx, val_idx) in enumerate(skf.split(data, fake_strat)):
-        print(f"Fold {fold+1}")
+    train_dataset = MRIAgeDataset(cached_dataset, train_indices)
+    val_dataset = MRIAgeDataset(cached_dataset, val_indices)
+    test_dataset = MRIAgeDataset(cached_dataset, test_indices)
 
-        # Create datasets using the preprocessed data (no augmentation)
-        train_dataset = MRIAgeDataset(data[train_idx], ages[train_idx])
-        val_dataset = MRIAgeDataset(data[val_idx], ages[val_idx])
+    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
+    test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
 
-        train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-        val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
-
-        model = create_vae_model(
-            hparams,
-            pretrained_path=PRE_TRAINED_WEIGHTS
-            / "all_model_monai_l1_autoencoder_diff_init_bs_8_heavily_weighted_loss_without_outside_brain_.pt",
-        ).to(device)
-
-        model = train_fold(train_loader, val_loader, model, epochs=1, hparams=hparams)
-
-        preds, targets, mse, r2 = evaluate(val_loader, model)
-        print(f"Validation MSE: {mse:.4f}, R2: {r2:.4f}")
-        preds_all[val_idx] = preds
-
-        # Save VAE model weights
-        os.makedirs("torch_weights/vae_weights", exist_ok=True)
-        torch.save(model.state_dict(), f"torch_weights/vae_weights/vae_fold_{fold}.pt")
-        break
-
-    print("Cross-Validation MSE:", mean_squared_error(ages, preds_all))
-    print("Cross-Validation R2:", r2_score(ages, preds_all))
-
-    # Train on all data now to get final model
-    print("Training on full dataset...")
-    full_dataset = MRIAgeDataset(data, ages)
-    full_loader = DataLoader(full_dataset, batch_size=64, shuffle=True)
+    print("Creating VAE model...")
     model = create_vae_model(
         hparams,
         pretrained_path=PRE_TRAINED_WEIGHTS
-        / "all_model_monai_l1_autoencoder_diff_init_bs_8_heavily_weighted_loss_without_outside_brain_.pt",
+        / "all_model_monai_l1_autoencoder_diff_init_bs_64_heavily_weighted_loss_without_outside_brain_.pt",
     ).to(device)
 
-    # Train the final VAE model on full dataset
-    final_model = train_fold(
-        full_loader, full_loader, model, epochs=80, hparams=hparams
+    print("Training VAE model with two-stage approach...")
+    trained_model = train_fold_two_stage(
+        train_loader, val_loader, model, epochs=hparams.n_epochs, hparams=hparams
     )
 
-    # Save final VAE model
-    os.makedirs("torch_weights/vae_weights", exist_ok=True)
-    torch.save(final_model.state_dict(), "torch_weights/vae_weights/vae_final.pt")
+    print("Evaluating on validation set...")
+    val_preds, val_targets, val_mse, val_r2 = evaluate(val_loader, trained_model)
+    print(f"Validation MSE: {val_mse:.4f}, R2: {val_r2:.4f}")
 
-    # Generate samples from VAE given age points
-    final_model.eval()
+    print("Evaluating on test set...")
+    test_preds, test_targets, test_mse, test_r2 = evaluate(test_loader, trained_model)
+    print(f"Test MSE: {test_mse:.4f}, R2: {test_r2:.4f}")
+
+    os.makedirs("torch_weights/vae_weights", exist_ok=True)
+    torch.save(trained_model.state_dict(), "torch_weights/vae_weights/vae_final.pt")
+    print("Model saved to torch_weights/vae_weights/vae_final.pt")
+
+    print("Generating age-conditioned samples...")
+    trained_model.eval()
     age_points = (
         torch.tensor([8.0, 10.0, 12.0, 14.0, 16.0, 18.0, 20.0], dtype=torch.float32)
         .unsqueeze(1)
@@ -635,23 +821,25 @@ def main(hparams):
 
     with torch.no_grad():
         # Generate age-dependent priors and sample from them
-        pz_mean, pz_logvar = final_model.age_to_prior(age_points)
+        pz_mean, pz_logvar = trained_model.age_to_prior(age_points)
 
         # Sample from the age-conditioned latent space
         z_samples = (
-            final_model.reparameterize(pz_mean, pz_logvar)
-            if hasattr(final_model, "reparameterize")
+            trained_model.reparameterize(pz_mean, pz_logvar)
+            if hasattr(trained_model, "reparameterize")
             else pz_mean
         )
 
         # Decode to images
-        generated_images = final_model.decode(z_samples)
+        generated_images = trained_model.decode(z_samples)
 
     for i, age in enumerate(age_points.squeeze().cpu().numpy()):
         img = generated_images[i]
         save_image_tensor(
             img, f"torch_generations_vae/axial_generations/generated_age_{age:.1f}.png"
         )
+
+    print("Generated images saved to torch_generations_vae/axial_generations/")
 
 
 if __name__ == "__main__":

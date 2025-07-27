@@ -11,6 +11,10 @@ module load python3/3.8.10
 module load pytorch/1.13.1
 
 source /projectnb/ace-genetics/jueqiw/software/venvs/monai/bin/activate
+
+cd /project/ace-genetics/jueqiw/code/Autism_Brain_Development/code/project/
+
+
 python3 /project/ace-genetics/jueqiw/code/Autism_Brain_Development/code/project/weighted_l1_all_monai_autoencoder.py \
     --loss_type simple_l1 \
     --weight_clamp_max 20.0 \

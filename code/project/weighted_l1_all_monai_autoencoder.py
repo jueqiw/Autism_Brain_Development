@@ -15,6 +15,7 @@ from monai.apps import download_and_extract
 from monai.config import print_config
 from monai.data import CacheDataset, DataLoader
 from monai.networks.nets import AutoEncoder, UNet
+from monai.networks.layers import Conv, Norm
 
 from fileinput import filename
 from PIL import Image
@@ -394,6 +395,37 @@ def load_data():
     return original_array, transformed_array, jacobian_array
 
 
+class CustomAutoEncoder(nn.Module):
+    def __init__(self, spatial_dims, in_channels, out_channels, channels, strides, num_res_units):
+        super().__init__()
+        
+        # First layer with InstanceNorm and PReLU
+        self.first_conv = Conv[Conv.CONV, spatial_dims](
+            in_channels=in_channels,
+            out_channels=channels[0],
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            norm=Norm.INSTANCE,
+            act="PRELU"
+        )
+        
+        # Base autoencoder (modify input channels since first layer is handled separately)
+        self.autoencoder = AutoEncoder(
+            spatial_dims=spatial_dims,
+            in_channels=channels[0],
+            out_channels=out_channels,
+            channels=channels,
+            strides=strides,
+            num_res_units=num_res_units,
+        )
+        
+    def forward(self, x):
+        # Pass through first layer with InstanceNorm and PReLU
+        x = self.first_conv(x)
+        # Pass through rest of autoencoder
+        return self.autoencoder(x)
+
 def main(hparams):
     original, transformed, jacobians = load_data()
 
@@ -407,7 +439,7 @@ def main(hparams):
     # --model_dropout 0.1 \
     # --batch_size 8
 
-    model = AutoEncoder(
+    model = CustomAutoEncoder(
         spatial_dims=2,
         in_channels=2,
         out_channels=1,

@@ -1,3 +1,5 @@
+import sys
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -31,47 +33,172 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
         self.latent_dim = latent_dim
         self.age_latent_dim = age_latent_dim
 
-        # Create the pretrained autoencoder
-        self.pretrained_autoencoder = AutoEncoder(
+        self.channels = channels
+        self.strides = strides
+        self.num_res_units = num_res_units
+        self.base_autoencoder = AutoEncoder(
             spatial_dims=2,
-            in_channels=2,
+            in_channels=1,
             out_channels=1,
             channels=channels,
             strides=strides,
             num_res_units=num_res_units,
         )
 
-        # Load pretrained weights if provided
         if pretrained_path:
-            print(f"Loading pretrained weights from {pretrained_path}")
-            state_dict = torch.load(pretrained_path, map_location="cpu")
-            self.pretrained_autoencoder.load_state_dict(state_dict)
-            print("Pretrained weights loaded successfully")
+            self._load_and_adapt_pretrained_weights(pretrained_path)
 
-        # Extract encoder and decoder from pretrained model
-        self.encoder_backbone = self.pretrained_autoencoder.encode
-        self.decoder_backbone = self.pretrained_autoencoder.decode
+        # Extract encoder and decoder
+        self.encoder_backbone = self.base_autoencoder.encode
+        self.decoder_backbone = self.base_autoencoder.decode
 
-        # Get the bottleneck feature size from the pretrained model
+        # Freeze all pretrained autoencoder parameters first
+        for param in self.base_autoencoder.parameters():
+            param.requires_grad = False
+
         self._determine_feature_sizes()
 
-        # VAE latent space layers
+        print(f"Creating linear layers with bottleneck_size: {self.bottleneck_size}")
         self.fc_z_mean = nn.Linear(self.bottleneck_size, latent_dim)
         self.fc_z_logvar = nn.Linear(self.bottleneck_size, latent_dim)
 
-        # Age regression layers
         self.fc_age_mean = nn.Linear(self.bottleneck_size, 1)
         self.fc_age_logvar = nn.Linear(self.bottleneck_size, 1)
 
-        # Latent to bottleneck projection for decoder
         self.fc_latent_to_bottleneck = nn.Linear(latent_dim, self.bottleneck_size)
 
         # Age-dependent prior generator
         self.age_to_prior = AgePriorGenerator(latent_dim)
 
+    def _load_and_adapt_pretrained_weights(self, pretrained_path):
+        """Load pretrained weights and adapt first conv layer from 2-channel to 1-channel"""
+        print(f"Loading pretrained weights from {pretrained_path}")
+
+        # Load the pretrained state dict
+        pretrained_state_dict = torch.load(pretrained_path, map_location="cpu")
+
+        # Create a new state dict for the 1-channel model
+        adapted_state_dict = {}
+
+        # Get the 2-channel first conv layer weights
+        first_conv_key = "encode.encode_0.conv.unit0.conv.weight"
+        if first_conv_key in pretrained_state_dict:
+            original_weights = pretrained_state_dict[first_conv_key]
+            print(f"Original first conv weight shape: {original_weights.shape}")
+
+            adapted_weights = original_weights.mean(dim=1, keepdim=True)
+            print(f"Adapted first conv weight shape: {adapted_weights.shape}")
+
+            adapted_state_dict[first_conv_key] = adapted_weights
+
+        for key, value in pretrained_state_dict.items():
+            if key != first_conv_key:
+                adapted_state_dict[key] = value
+
+        try:
+            missing_keys, unexpected_keys = self.base_autoencoder.load_state_dict(
+                adapted_state_dict, strict=False
+            )
+            if missing_keys:
+                print(f"Missing keys: {missing_keys}")
+            if unexpected_keys:
+                print(f"Unexpected keys: {unexpected_keys}")
+            print("Weights adapted and loaded successfully")
+        except Exception as e:
+            print(f"Error loading adapted weights: {e}")
+            print("Falling back to random initialization")
+
+    def set_encoder_layer_trainable(self, layer_idx, trainable=True):
+        """Set specific encoder layer as trainable or frozen"""
+        layer_name = f"encode_{layer_idx}"
+        if hasattr(self.encoder_backbone, layer_name):
+            layer = getattr(self.encoder_backbone, layer_name)
+            for param in layer.parameters():
+                param.requires_grad = trainable
+
+    def set_decoder_layer_trainable(self, layer_idx, trainable=True):
+        """Set specific decoder layer as trainable or frozen"""
+        layer_name = f"decode_{layer_idx}"
+        if hasattr(self.decoder_backbone, layer_name):
+            layer = getattr(self.decoder_backbone, layer_name)
+            for param in layer.parameters():
+                param.requires_grad = trainable
+
+    def freeze_pretrained_encoder(self):
+        """Freeze all pretrained encoder layers except the first conv"""
+        for param in self.encoder_backbone.parameters():
+            param.requires_grad = False
+        # Keep first conv layer trainable
+        self.set_encoder_layer_trainable(0, trainable=True)
+
+    def freeze_pretrained_decoder(self):
+        """Freeze all pretrained decoder layers"""
+        for param in self.decoder_backbone.parameters():
+            param.requires_grad = False
+
+    def unfreeze_encoder_layer_by_layer(self, stage):
+        """Gradually unfreeze encoder layers from deeper to shallower"""
+        # Stage 0: only first conv + VAE heads (warm-up)
+        # Stage 1: unfreeze deepest layers first
+        # Stage 2: unfreeze middle layers
+        # Stage 3: unfreeze all layers
+
+        if stage >= 1:
+            # Unfreeze deeper layers first (encode_2, encode_1, etc.)
+            for layer_idx in reversed(range(1, 3)):  # encode_2, encode_1
+                if stage >= (3 - layer_idx):
+                    self.set_encoder_layer_trainable(layer_idx, trainable=True)
+
+    def get_parameter_groups(self, new_lr=1e-3, pretrained_lr=1e-4, weight_decay=1e-4):
+        """Get parameter groups with different learning rates and regularization"""
+        new_params = []
+        pretrained_params = []
+
+        # New VAE-specific layers (higher LR, no weight decay)
+        for module in [
+            self.fc_z_mean,
+            self.fc_z_logvar,
+            self.fc_age_mean,
+            self.fc_age_logvar,
+            self.fc_latent_to_bottleneck,
+            self.age_to_prior,
+        ]:
+            module_params = [p for p in module.parameters() if p.requires_grad]
+            print(
+                f"Adding {len(module_params)} params from {module.__class__.__name__}"
+            )
+            for i, p in enumerate(module_params):
+                print(f"  Param {i}: shape {p.shape}")
+            new_params.extend(module_params)
+
+        # First conv layer from encoder (higher LR, no weight decay)
+        if hasattr(self.encoder_backbone, "encode_0"):
+            new_params.extend(
+                [
+                    p
+                    for p in self.encoder_backbone.encode_0.parameters()
+                    if p.requires_grad
+                ]
+            )
+
+        # Pretrained layers (lower LR, with weight decay for regularization)
+        for module in [self.encoder_backbone, self.decoder_backbone]:
+            for name, param in module.named_parameters():
+                if param.requires_grad and param not in new_params:
+                    pretrained_params.append(param)
+
+        return [
+            {"params": new_params, "lr": new_lr, "weight_decay": 0.0},
+            {
+                "params": pretrained_params,
+                "lr": pretrained_lr,
+                "weight_decay": weight_decay,
+            },
+        ]
+
     def _determine_feature_sizes(self):
         """Determine the bottleneck feature size by running a dummy forward pass"""
-        dummy_input = torch.randn(1, 2, 192, 192)
+        dummy_input = torch.randn(1, 1, 192, 192)
 
         with torch.no_grad():
             # Get encoder output (bottleneck features)
@@ -244,27 +371,21 @@ def vae_loss_function(
 def create_vae_model(hparams, pretrained_path=None):
     """Factory function to create VAE model with pretrained weights"""
 
-    # Parse model architecture parameters
-    channels = tuple(map(int, hparams.model_channels.split(",")))
-    strides = tuple(map(int, hparams.model_strides.split(",")))
-
     # Create VAE model
     model = VAEWithPretrainedAutoEncoder(
-        channels=channels,
-        strides=strides,
-        num_res_units=hparams.num_res_units,
+        channels=(32, 64, 64),
+        strides=(2, 2, 1),
+        num_res_units=3,
         latent_dim=getattr(hparams, "latent_dim", 32),
         pretrained_path=pretrained_path,
     )
 
-    # Initialize new layers (VAE-specific ones)
     def init_new_layers(m):
         if isinstance(m, nn.Linear) and hasattr(m, "weight"):
             torch.nn.init.xavier_normal_(m.weight, gain=1.0)
             if m.bias is not None:
                 torch.nn.init.zeros_(m.bias)
 
-    # Only initialize the new VAE layers, not pretrained ones
     model.fc_z_mean.apply(init_new_layers)
     model.fc_z_logvar.apply(init_new_layers)
     model.fc_age_mean.apply(init_new_layers)
