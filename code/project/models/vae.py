@@ -67,6 +67,26 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
 
         self.fc_latent_to_bottleneck = nn.Linear(latent_dim, self.bottleneck_size)
 
+        # Additional encoder layer to compress the latent space
+        # This will reduce the large bottleneck size to something manageable for VAE
+        self.additional_encoder = nn.Sequential(
+            # Aggressive pooling to reduce 48x48 to 2x2 for small latent space
+            nn.AdaptiveAvgPool2d((2, 2)),  # 64 * 2 * 2 = 256
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+        )
+        
+        # Corresponding decoder layer to upsample back
+        self.additional_decoder = nn.Sequential(
+            nn.ConvTranspose2d(128, 64, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+        )
+        
+        # Final interpolation layer to match pretrained decoder input size
+        self.interpolate_to_decoder = nn.Upsample(size=(48, 48), mode='bilinear', align_corners=False)
+
         # Age-dependent prior generator
         self.age_to_prior = AgePriorGenerator(latent_dim)
 
@@ -104,6 +124,11 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
             if unexpected_keys:
                 print(f"Unexpected keys: {unexpected_keys}")
             print("Weights adapted and loaded successfully")
+            
+            # Verify the first conv layer has correct shape
+            first_conv_weight = self.base_autoencoder.encode.encode_0.conv.unit0.conv.weight
+            print(f"Loaded first conv weight shape: {first_conv_weight.shape}")
+            
         except Exception as e:
             print(f"Error loading adapted weights: {e}")
             print("Falling back to random initialization")
@@ -162,14 +187,21 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
             self.fc_age_logvar,
             self.fc_latent_to_bottleneck,
             self.age_to_prior,
+            self.additional_encoder,
+            self.additional_decoder,
         ]:
-            module_params = [p for p in module.parameters() if p.requires_grad]
-            print(
-                f"Adding {len(module_params)} params from {module.__class__.__name__}"
-            )
-            for i, p in enumerate(module_params):
-                print(f"  Param {i}: shape {p.shape}")
-            new_params.extend(module_params)
+            try:
+                module_params = [p for p in module.parameters() if p.requires_grad]
+                print(
+                    f"Adding {len(module_params)} params from {module.__class__.__name__}"
+                )
+                for i, p in enumerate(module_params):
+                    print(f"  Param {i}: shape {p.shape}")
+                new_params.extend(module_params)
+            except Exception as e:
+                print(f"Error processing module {module.__class__.__name__}: {e}")
+                print(f"Module: {module}")
+                raise
 
         # First conv layer from encoder (higher LR, no weight decay)
         if hasattr(self.encoder_backbone, "encode_0"):
@@ -201,21 +233,27 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
         dummy_input = torch.randn(1, 1, 192, 192)
 
         with torch.no_grad():
-            # Get encoder output (bottleneck features)
+            # Get encoder output (bottleneck features from pretrained encoder)
             bottleneck_features = self.encoder_backbone(dummy_input)
 
             # Flatten to get the size
             if isinstance(bottleneck_features, (list, tuple)):
                 bottleneck_features = bottleneck_features[-1]
 
-            # Get the flattened size
-            self.bottleneck_size = bottleneck_features.view(
-                bottleneck_features.size(0), -1
+            print(f"Pretrained encoder output shape: {bottleneck_features.shape}")
+            
+            # Pass through additional encoder layers to compress further
+            compressed_features = self.additional_encoder(bottleneck_features)
+            print(f"After additional encoder shape: {compressed_features.shape}")
+            
+            # Flatten to get the compressed size for VAE
+            self.bottleneck_size = compressed_features.view(
+                compressed_features.size(0), -1
             ).size(1)
-            self.bottleneck_shape = bottleneck_features.shape[1:]
+            self.bottleneck_shape = compressed_features.shape[1:]
 
-        print(f"Bottleneck size determined: {self.bottleneck_size}")
-        print(f"Bottleneck shape: {self.bottleneck_shape}")
+        print(f"Final bottleneck size for VAE: {self.bottleneck_size}")
+        print(f"Final bottleneck shape: {self.bottleneck_shape}")
 
     def encode(self, x):
         """Encode input to VAE latent space and age prediction"""
@@ -226,7 +264,11 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
         if isinstance(bottleneck_features, (list, tuple)):
             bottleneck_features = bottleneck_features[-1]
 
-        flat_features = bottleneck_features.view(bottleneck_features.size(0), -1)
+        # Pass through additional encoder layers to compress further
+        compressed_features = self.additional_encoder(bottleneck_features)
+        
+        # Flatten compressed features
+        flat_features = compressed_features.view(compressed_features.size(0), -1)
 
         # VAE latent parameters
         z_mean = self.fc_z_mean(flat_features)
@@ -242,14 +284,20 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
 
     def decode(self, z):
         """Decode from VAE latent space to output"""
-        # Project latent back to bottleneck size
-        bottleneck_flat = self.fc_latent_to_bottleneck(z)
+        # Project latent back to compressed bottleneck size
+        compressed_flat = self.fc_latent_to_bottleneck(z)
 
-        # Reshape to original bottleneck shape
-        bottleneck_features = bottleneck_flat.view(-1, *self.bottleneck_shape)
+        # Reshape to compressed bottleneck shape
+        compressed_features = compressed_flat.view(-1, *self.bottleneck_shape)
+
+        # Pass through additional decoder layers to expand back
+        expanded_features = self.additional_decoder(compressed_features)
+        
+        # Interpolate to match pretrained decoder input size (48x48)
+        decoder_input = self.interpolate_to_decoder(expanded_features)
 
         # Use pretrained decoder
-        reconstruction = self.decoder_backbone(bottleneck_features)
+        reconstruction = self.decoder_backbone(decoder_input)
 
         return reconstruction
 
