@@ -338,7 +338,6 @@ def log_vae_images(writer, inputs, reconstructions, ages, epoch, prefix=""):
     plt.close(fig)
 
 
-# Two-stage training function with warm-up and gradual fine-tuning
 def train_fold_two_stage(
     train_loader, val_loader, model, epochs, lr=1e-3, hparams=None
 ):
@@ -370,7 +369,6 @@ def train_fold_two_stage(
     model.freeze_pretrained_encoder()
     model.freeze_pretrained_decoder()
 
-    # Use higher LR for new layers only during warm-up
     param_groups = model.get_parameter_groups(
         new_lr=lr, pretrained_lr=lr / 10, weight_decay=1e-4
     )
@@ -388,7 +386,6 @@ def train_fold_two_stage(
                 f"Warm-up Epoch {epoch+1}/{warmup_epochs} - Train: {train_loss:.6f} | Val: {val_loss:.6f}"
             )
 
-    # ========== STAGE 2: GRADUAL FINE-TUNING ==========
     print("Stage 2: Gradual fine-tuning...")
 
     for stage in range(1, 4):  # 3 fine-tuning stages
@@ -397,7 +394,6 @@ def train_fold_two_stage(
         # Gradually unfreeze layers
         model.unfreeze_encoder_layer_by_layer(stage)
 
-        # Update parameter groups with different LRs and regularization
         param_groups = model.get_parameter_groups(
             new_lr=lr * 0.5,  # Lower LR for new layers in fine-tuning
             pretrained_lr=lr * 0.1,  # Much lower LR for pretrained layers
@@ -763,7 +759,6 @@ def main(hparams):
     cached_dataset = create_monai_dataset(cache_rate=0.1, num_workers=8)
     print(f"Loaded cached dataset with {len(cached_dataset)} samples")
 
-    # Split dataset into train/val/test (8:1:1) using MONAI partition_dataset
     print("Splitting dataset into train/val/test (8:1:1)...")
     data_partitions = partition_dataset(
         data=list(range(len(cached_dataset))),
@@ -792,12 +787,11 @@ def main(hparams):
         / "all_model_monai_l1_autoencoder_diff_init_bs_64_heavily_weighted_loss_without_outside_brain_.pt",
     ).to(device)
 
-    print("Training VAE model with two-stage approach...")
     trained_model = train_fold_two_stage(
         train_loader, val_loader, model, epochs=hparams.n_epochs, hparams=hparams
     )
 
-    print("Evaluating on validation set...")
+    print("Evaluating on validation set")
     val_preds, val_targets, val_mse, val_r2 = evaluate(val_loader, trained_model)
     print(f"Validation MSE: {val_mse:.4f}, R2: {val_r2:.4f}")
 

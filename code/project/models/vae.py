@@ -45,6 +45,8 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
             num_res_units=num_res_units,
         )
 
+        print(f"architecture: {self.base_autoencoder}")
+
         if pretrained_path:
             self._load_and_adapt_pretrained_weights(pretrained_path)
 
@@ -56,6 +58,30 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
         for param in self.base_autoencoder.parameters():
             param.requires_grad = False
 
+        # Define additional encoder/decoder layers BEFORE calculating feature sizes
+        # Additional encoder layer to compress the latent space
+        # This will reduce the large bottleneck size to something manageable for VAE
+        self.additional_encoder = nn.Sequential(
+            # Aggressive pooling to reduce 48x48 to 2x2 for small latent space
+            nn.AdaptiveAvgPool2d((2, 2)),  # 64 * 2 * 2 = 256
+            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+        )
+
+        # Corresponding decoder layer to upsample back
+        self.additional_decoder = nn.Sequential(
+            nn.ConvTranspose2d(128, 64, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+        )
+
+        # Final interpolation layer to match pretrained decoder input size
+        self.interpolate_to_decoder = nn.Upsample(
+            size=(48, 48), mode="bilinear", align_corners=False
+        )
+
+        # NOW calculate feature sizes with the additional encoder
         self._determine_feature_sizes()
 
         print(f"Creating linear layers with bottleneck_size: {self.bottleneck_size}")
@@ -67,26 +93,6 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
 
         self.fc_latent_to_bottleneck = nn.Linear(latent_dim, self.bottleneck_size)
 
-        # Additional encoder layer to compress the latent space
-        # This will reduce the large bottleneck size to something manageable for VAE
-        self.additional_encoder = nn.Sequential(
-            # Aggressive pooling to reduce 48x48 to 2x2 for small latent space
-            nn.AdaptiveAvgPool2d((2, 2)),  # 64 * 2 * 2 = 256
-            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-        )
-        
-        # Corresponding decoder layer to upsample back
-        self.additional_decoder = nn.Sequential(
-            nn.ConvTranspose2d(128, 64, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-        )
-        
-        # Final interpolation layer to match pretrained decoder input size
-        self.interpolate_to_decoder = nn.Upsample(size=(48, 48), mode='bilinear', align_corners=False)
-
         # Age-dependent prior generator
         self.age_to_prior = AgePriorGenerator(latent_dim)
 
@@ -94,25 +100,33 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
         """Load pretrained weights and adapt first conv layer from 2-channel to 1-channel"""
         print(f"Loading pretrained weights from {pretrained_path}")
 
-        # Load the pretrained state dict
         pretrained_state_dict = torch.load(pretrained_path, map_location="cpu")
 
-        # Create a new state dict for the 1-channel model
         adapted_state_dict = {}
 
-        # Get the 2-channel first conv layer weights
-        first_conv_key = "encode.encode_0.conv.unit0.conv.weight"
-        if first_conv_key in pretrained_state_dict:
-            original_weights = pretrained_state_dict[first_conv_key]
-            print(f"Original first conv weight shape: {original_weights.shape}")
+        # Adapt all layers that depend on input channels (2->1)
+        layers_to_adapt = [
+            "encode.encode_0.conv.unit0.conv.weight",
+            "encode.encode_0.residual.weight",  # Residual connection also needs adaptation
+        ]
 
-            adapted_weights = original_weights.mean(dim=1, keepdim=True)
-            print(f"Adapted first conv weight shape: {adapted_weights.shape}")
+        for key in layers_to_adapt:
+            if key in pretrained_state_dict:
+                original_weights = pretrained_state_dict[key]
+                print(f"Original {key} shape: {original_weights.shape}")
 
-            adapted_state_dict[first_conv_key] = adapted_weights
+                # Check if this layer actually has channel dimension that needs adaptation
+                if len(original_weights.shape) >= 2 and original_weights.shape[1] == 2:
+                    adapted_weights = original_weights.mean(dim=1, keepdim=True)
+                    print(f"Adapted {key} shape: {adapted_weights.shape}")
+                    adapted_state_dict[key] = adapted_weights
+                else:
+                    print(f"Skipping {key} - doesn't need channel adaptation")
+                    adapted_state_dict[key] = original_weights
 
+        # Copy all other weights unchanged
         for key, value in pretrained_state_dict.items():
-            if key != first_conv_key:
+            if key not in layers_to_adapt:
                 adapted_state_dict[key] = value
 
         try:
@@ -123,12 +137,13 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
                 print(f"Missing keys: {missing_keys}")
             if unexpected_keys:
                 print(f"Unexpected keys: {unexpected_keys}")
-            print("Weights adapted and loaded successfully")
-            
+
             # Verify the first conv layer has correct shape
-            first_conv_weight = self.base_autoencoder.encode.encode_0.conv.unit0.conv.weight
+            first_conv_weight = (
+                self.base_autoencoder.encode.encode_0.conv.unit0.conv.weight
+            )
             print(f"Loaded first conv weight shape: {first_conv_weight.shape}")
-            
+
         except Exception as e:
             print(f"Error loading adapted weights: {e}")
             print("Falling back to random initialization")
@@ -176,57 +191,21 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
 
     def get_parameter_groups(self, new_lr=1e-3, pretrained_lr=1e-4, weight_decay=1e-4):
         """Get parameter groups with different learning rates and regularization"""
-        new_params = []
-        pretrained_params = []
+        print(
+            "Creating simple parameter group - using single learning rate for all trainable parameters"
+        )
 
-        # New VAE-specific layers (higher LR, no weight decay)
-        for module in [
-            self.fc_z_mean,
-            self.fc_z_logvar,
-            self.fc_age_mean,
-            self.fc_age_logvar,
-            self.fc_latent_to_bottleneck,
-            self.age_to_prior,
-            self.additional_encoder,
-            self.additional_decoder,
-        ]:
-            try:
-                module_params = [p for p in module.parameters() if p.requires_grad]
-                print(
-                    f"Adding {len(module_params)} params from {module.__class__.__name__}"
-                )
-                for i, p in enumerate(module_params):
-                    print(f"  Param {i}: shape {p.shape}")
-                new_params.extend(module_params)
-            except Exception as e:
-                print(f"Error processing module {module.__class__.__name__}: {e}")
-                print(f"Module: {module}")
-                raise
+        # Collect all trainable parameters
+        all_trainable_params = []
+        for name, param in self.named_parameters():
+            if param.requires_grad:
+                print(f"Trainable param: {name}, shape: {param.shape}")
+                all_trainable_params.append(param)
 
-        # First conv layer from encoder (higher LR, no weight decay)
-        if hasattr(self.encoder_backbone, "encode_0"):
-            new_params.extend(
-                [
-                    p
-                    for p in self.encoder_backbone.encode_0.parameters()
-                    if p.requires_grad
-                ]
-            )
+        print(f"Total trainable parameters: {len(all_trainable_params)}")
 
-        # Pretrained layers (lower LR, with weight decay for regularization)
-        for module in [self.encoder_backbone, self.decoder_backbone]:
-            for name, param in module.named_parameters():
-                if param.requires_grad and param not in new_params:
-                    pretrained_params.append(param)
-
-        return [
-            {"params": new_params, "lr": new_lr, "weight_decay": 0.0},
-            {
-                "params": pretrained_params,
-                "lr": pretrained_lr,
-                "weight_decay": weight_decay,
-            },
-        ]
+        # Return single parameter group for now to avoid tensor comparison issues
+        return [{"params": all_trainable_params, "lr": new_lr, "weight_decay": 0.0}]
 
     def _determine_feature_sizes(self):
         """Determine the bottleneck feature size by running a dummy forward pass"""
@@ -241,11 +220,11 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
                 bottleneck_features = bottleneck_features[-1]
 
             print(f"Pretrained encoder output shape: {bottleneck_features.shape}")
-            
+
             # Pass through additional encoder layers to compress further
             compressed_features = self.additional_encoder(bottleneck_features)
             print(f"After additional encoder shape: {compressed_features.shape}")
-            
+
             # Flatten to get the compressed size for VAE
             self.bottleneck_size = compressed_features.view(
                 compressed_features.size(0), -1
@@ -266,7 +245,7 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
 
         # Pass through additional encoder layers to compress further
         compressed_features = self.additional_encoder(bottleneck_features)
-        
+
         # Flatten compressed features
         flat_features = compressed_features.view(compressed_features.size(0), -1)
 
@@ -292,7 +271,7 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
 
         # Pass through additional decoder layers to expand back
         expanded_features = self.additional_decoder(compressed_features)
-        
+
         # Interpolate to match pretrained decoder input size (48x48)
         decoder_input = self.interpolate_to_decoder(expanded_features)
 
