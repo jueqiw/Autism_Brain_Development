@@ -5,7 +5,9 @@ from pathlib import Path
 ABIDE_PATH = Path("/projectnb/ace-ig/ABIDE/").resolve()
 ABIDE_I_2D_REGRESSION = Path("/projectnb/ace-ig/ABIDE/ABIDE_I_2D").resolve()
 ABIDE_II_2D_REGRESSION = Path("/projectnb/ace-ig/ABIDE/ABIDE_II_2D").resolve()
-PRE_TRAINED_WEIGHTS = Path("/projectnb/ace-genetics/jueqiw/experiment/Autism_Brain_Development/pretrain_weight").resolve()
+PRE_TRAINED_WEIGHTS = Path(
+    "/projectnb/ace-genetics/jueqiw/experiment/Autism_Brain_Development/pretrain_weight"
+).resolve()
 
 
 ABIDE_I_transform = Path("/projectnb/ace-genetics/ABIDE/ABIDE_I").resolve()

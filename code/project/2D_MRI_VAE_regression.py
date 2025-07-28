@@ -1,5 +1,6 @@
 import os
 import glob
+import sys
 from argparse import ArgumentParser
 from concurrent.futures import ThreadPoolExecutor
 import pickle
@@ -23,7 +24,7 @@ from monai.transforms import (
     ScaleIntensityRanged,
     ToTensord,
 )
-from monai.data import CacheDataset, partition_dataset
+from monai.data import CacheDataset, partition_dataset, NibabelReader
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
@@ -48,23 +49,16 @@ def get_data_transforms():
     """Create MONAI transforms for data preprocessing with intensity normalization"""
     return Compose(
         [
-            LoadImaged(keys=["image"], image_only=True),
-            EnsureChannelFirstd(keys=["image"]),
-            Resized(keys=["image"], spatial_size=(192, 192)),
-            ScaleIntensityRanged(
-                keys=["image"], a_min=0.5, a_max=99.5, b_min=0.0, b_max=1.0, clip=True
+            LoadImaged(
+                keys=["image"],
+                image_only=True,
+                ensure_channel_first=True,  # (C, H, W) instead of (H, W)
+                reader=NibabelReader(),
             ),
-            ToTensord(keys=["image"]),
+            Resized(keys=["image"], spatial_size=(192, 192)),
+            ToTensord(keys=["image", "age"]),
         ]
     )
-
-
-# Normalize a single slice (kept for backward compatibility)
-def normalize_slice(slice_data):
-    lower, upper = np.percentile(slice_data, [0.5, 99.5])
-    slice_clipped = np.clip(slice_data, lower, upper)
-    normalized = (slice_clipped - lower) / (upper - lower + 1e-8)
-    return normalized
 
 
 class MRIAgeDataset(Dataset):
@@ -87,105 +81,6 @@ class MRIAgeDataset(Dataset):
         img = sample["image"]  # Already preprocessed tensor
         age = torch.tensor([sample["age"]], dtype=torch.float32)
         return img, age
-
-
-# Reparameterization trick
-def reparameterize(mu, logvar):
-    std = torch.exp(0.5 * logvar)
-    eps = torch.randn_like(std)
-    return mu + eps * std
-
-
-# Encoder module
-class Encoder(nn.Module):
-    def __init__(self, latent_dim=16, ft_bank_baseline=16, dropout_alpha=0.5):
-        super().__init__()
-        self.conv1 = nn.Conv2d(1, ft_bank_baseline, kernel_size=3, padding=1)
-        self.pool = nn.MaxPool2d(2)
-        self.conv2 = nn.Conv2d(ft_bank_baseline, ft_bank_baseline * 2, 3, padding=1)
-        self.conv3 = nn.Conv2d(ft_bank_baseline * 2, ft_bank_baseline * 4, 3, padding=1)
-        self.flatten_size = (192 // 8) * (192 // 8) * ft_bank_baseline * 4
-
-        self.dropout = nn.Dropout(dropout_alpha)
-        self.flatten = nn.Flatten()
-        self.fc1 = nn.Linear(self.flatten_size, latent_dim * 4)
-        self.fc_z_mean = nn.Linear(latent_dim * 4, latent_dim)
-        self.fc_z_log_var = nn.Linear(latent_dim * 4, latent_dim)
-
-        self.fc_r_mean = nn.Linear(latent_dim * 4, 1)
-        self.fc_r_log_var = nn.Linear(latent_dim * 4, 1)
-
-    def forward(self, x):
-        x = F.relu(self.conv1(x))
-        x = self.pool(x)
-        x = F.relu(self.conv2(x))
-        x = self.pool(x)
-        x = F.relu(self.conv3(x))
-        x = self.pool(x)
-        x = self.flatten(x)
-        x = self.dropout(x)
-        x = torch.tanh(self.fc1(x))
-
-        z_mean = self.fc_z_mean(x)
-        z_log_var = self.fc_z_log_var(x)
-        r_mean = self.fc_r_mean(x)
-        r_log_var = self.fc_r_log_var(x)
-
-        z = reparameterize(z_mean, z_log_var)
-        r = reparameterize(r_mean, r_log_var)
-        return z_mean, z_log_var, z, r_mean, r_log_var, r
-
-
-# Generator module (generates latent distribution parameters from age)
-class Generator(nn.Module):
-    def __init__(self, latent_dim=16):
-        super().__init__()
-        self.pz_mean = nn.Linear(1, latent_dim)
-        self.pz_log_var = nn.Linear(1, 1)
-
-    def forward(self, r):
-        pz_mean = self.pz_mean(r)
-        pz_log_var = self.pz_log_var(r)
-        return pz_mean, pz_log_var
-
-
-# Decoder module (decodes latent z to image)
-class Decoder(nn.Module):
-    def __init__(self, latent_dim=16, ft_bank_baseline=16):
-        super().__init__()
-        self.latent_dim = latent_dim
-        self.ft_bank_baseline = ft_bank_baseline
-
-        downsampled_H = 192 // 8
-        downsampled_W = 192 // 8
-        self.flattened_size = downsampled_H * downsampled_W * ft_bank_baseline * 4
-
-        self.fc1 = nn.Linear(latent_dim, latent_dim * 2)
-        self.fc2 = nn.Linear(latent_dim * 2, latent_dim * 4)
-        self.fc3 = nn.Linear(latent_dim * 4, self.flattened_size)
-
-        self.conv1 = nn.Conv2d(ft_bank_baseline * 4, ft_bank_baseline * 4, 3, padding=1)
-        self.conv2 = nn.Conv2d(ft_bank_baseline * 4, ft_bank_baseline * 2, 3, padding=1)
-        self.conv3 = nn.Conv2d(ft_bank_baseline * 2, ft_bank_baseline, 3, padding=1)
-        self.conv4 = nn.Conv2d(ft_bank_baseline, 1, 3, padding=1)
-
-        self.upsample = nn.Upsample(scale_factor=2)
-
-    def forward(self, z):
-        x = torch.tanh(self.fc1(z))
-        x = torch.tanh(self.fc2(x))
-        x = F.relu(self.fc3(x))
-        x = x.view(-1, self.ft_bank_baseline * 4, 192 // 8, 192 // 8)
-
-        x = F.relu(self.conv1(x))
-        x = self.upsample(x)
-        x = F.relu(self.conv2(x))
-        x = self.upsample(x)
-        x = F.relu(self.conv3(x))
-        x = self.upsample(x)
-        x = self.conv4(x)
-        # No activation if not binary image (can add sigmoid if needed)
-        return x
 
 
 # Loss function combining reconstruction, KL, and label (age) loss
@@ -239,7 +134,7 @@ def prepare_data_dicts():
     """Prepare data dictionaries for MONAI CacheDataset"""
     folder_paths = [
         ABIDE_I_2D_REGRESSION / "axial",
-        ABIDE_II_2D_REGRESSION / "axial",
+        # ABIDE_II_2D_REGRESSION / "axial",
     ]
 
     data_dicts = []
@@ -251,7 +146,7 @@ def prepare_data_dicts():
 
         print(f"Scanning folder: {folder_path}")
         for filename in os.listdir(folder_path):
-            if filename.endswith(".png"):
+            if filename.endswith(".npy"):
                 subject_id = filename[2:7]
                 dataset_num = 1 if "ABIDE_I_2D" in str(folder_path) else 2
                 age = get_ages(subject_id, dataset_num)
@@ -259,16 +154,17 @@ def prepare_data_dicts():
                 if age is None:
                     continue
 
-                img_path = str(folder_path / filename)
+                if age < 21:
+                    img_path = str(folder_path / filename)
 
-                data_dicts.append(
-                    {
-                        "image": img_path,
-                        "age": float(age),
-                        "subject_id": subject_id,
-                        "dataset_num": dataset_num,
-                    }
-                )
+                    data_dicts.append(
+                        {
+                            "image": img_path,
+                            "age": float(age),
+                            "subject_id": subject_id,
+                            "dataset_num": dataset_num,
+                        }
+                    )
 
     print(f"Found {len(data_dicts)} valid samples")
     return data_dicts
@@ -277,13 +173,11 @@ def prepare_data_dicts():
 def create_monai_dataset(cache_rate=1.0, num_workers=4):
     """Create MONAI CacheDataset for data loading"""
 
-    # Prepare data dictionaries
     data_dicts = prepare_data_dicts()
 
     if len(data_dicts) == 0:
         raise ValueError("No valid data found!")
 
-    # Create single cache dataset (no augmentation)
     print("Creating MONAI CacheDataset...")
     cached_ds = CacheDataset(
         data=data_dicts,
@@ -294,15 +188,6 @@ def create_monai_dataset(cache_rate=1.0, num_workers=4):
     )
 
     return cached_ds
-
-
-def save_image_tensor(img_tensor, filename):
-    # img_tensor shape: (1, H, W)
-    img_np = img_tensor.squeeze().cpu().numpy()
-    img_np = np.clip(img_np, 0, 1)
-    img_np = (img_np * 255).astype(np.uint8)
-    img = Image.fromarray(img_np)
-    img.save(filename)
 
 
 def log_vae_images(writer, inputs, reconstructions, ages, epoch, prefix=""):
@@ -364,7 +249,6 @@ def train_fold_two_stage(
     total_train_history = []
     total_val_history = []
 
-    # ========== STAGE 1: WARM-UP ==========
     print("Stage 1: Warm-up with frozen encoder...")
     model.freeze_pretrained_encoder()
     model.freeze_pretrained_decoder()
@@ -444,8 +328,6 @@ def train_epoch(train_loader, val_loader, model, optimizer, writer, epoch, stage
         ages = ages.to(device)
 
         optimizer.zero_grad()
-
-        # Forward pass through VAE
         (
             recon,
             z_mean,
@@ -756,21 +638,50 @@ def evaluate(val_loader, model):
 
 def main(hparams):
     # Load cached dataset directly
-    cached_dataset = create_monai_dataset(cache_rate=0.1, num_workers=8)
+    cached_dataset = create_monai_dataset(cache_rate=0.05, num_workers=8)
     print(f"Loaded cached dataset with {len(cached_dataset)} samples")
 
-    print("Splitting dataset into train/val/test (8:1:1)...")
-    data_partitions = partition_dataset(
-        data=list(range(len(cached_dataset))),
-        ratios=[0.8, 0.1, 0.1],
-        shuffle=True,
-        seed=42,
-    )
+    print("Splitting dataset by subjects into train/val/test (8:1:1)...")
 
-    train_indices, val_indices, test_indices = data_partitions
-    print(f"Train samples: {len(train_indices)}")
-    print(f"Validation samples: {len(val_indices)}")
-    print(f"Test samples: {len(test_indices)}")
+    # Get all unique subjects and their sample indices
+    subject_to_indices = {}
+    for idx, sample in enumerate(cached_dataset.data):
+        subject_id = sample["subject_id"]
+        if subject_id not in subject_to_indices:
+            subject_to_indices[subject_id] = []
+        subject_to_indices[subject_id].append(idx)
+
+    # Split subjects into train/val/test
+    unique_subjects = list(subject_to_indices.keys())
+    np.random.seed(42)
+    np.random.shuffle(unique_subjects)
+
+    n_subjects = len(unique_subjects)
+    train_split = int(0.8 * n_subjects)
+    val_split = int(0.9 * n_subjects)
+
+    train_subjects = unique_subjects[:train_split]
+    val_subjects = unique_subjects[train_split:val_split]
+    test_subjects = unique_subjects[val_split:]
+
+    # Get sample indices for each split
+    train_indices = []
+    val_indices = []
+    test_indices = []
+
+    for subject in train_subjects:
+        train_indices.extend(subject_to_indices[subject])
+    for subject in val_subjects:
+        val_indices.extend(subject_to_indices[subject])
+    for subject in test_subjects:
+        test_indices.extend(subject_to_indices[subject])
+
+    print(
+        f"Subjects - Train: {len(train_subjects)}, Val: {len(val_subjects)}, Test: {len(test_subjects)}"
+    )
+    print(
+        f"Samples - Train: {len(train_indices)}, Val: {len(val_indices)}, Test: {len(test_indices)}"
+    )
 
     train_dataset = MRIAgeDataset(cached_dataset, train_indices)
     val_dataset = MRIAgeDataset(cached_dataset, val_indices)
@@ -780,7 +691,6 @@ def main(hparams):
     val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)
 
-    print("Creating VAE model...")
     model = create_vae_model(
         hparams,
         pretrained_path=PRE_TRAINED_WEIGHTS
@@ -791,7 +701,6 @@ def main(hparams):
         train_loader, val_loader, model, epochs=hparams.n_epochs, hparams=hparams
     )
 
-    print("Evaluating on validation set")
     val_preds, val_targets, val_mse, val_r2 = evaluate(val_loader, trained_model)
     print(f"Validation MSE: {val_mse:.4f}, R2: {val_r2:.4f}")
 
@@ -803,7 +712,6 @@ def main(hparams):
     torch.save(trained_model.state_dict(), "torch_weights/vae_weights/vae_final.pt")
     print("Model saved to torch_weights/vae_weights/vae_final.pt")
 
-    print("Generating age-conditioned samples...")
     trained_model.eval()
     age_points = (
         torch.tensor([8.0, 10.0, 12.0, 14.0, 16.0, 18.0, 20.0], dtype=torch.float32)
@@ -827,11 +735,11 @@ def main(hparams):
         # Decode to images
         generated_images = trained_model.decode(z_samples)
 
-    for i, age in enumerate(age_points.squeeze().cpu().numpy()):
-        img = generated_images[i]
-        save_image_tensor(
-            img, f"torch_generations_vae/axial_generations/generated_age_{age:.1f}.png"
-        )
+    # for i, age in enumerate(age_points.squeeze().cpu().numpy()):
+    #     img = generated_images[i]
+    #     save_image_tensor(
+    #         img, f"torch_generations_vae/axial_generations/generated_age_{age:.1f}.png"
+    #     )
 
     print("Generated images saved to torch_generations_vae/axial_generations/")
 

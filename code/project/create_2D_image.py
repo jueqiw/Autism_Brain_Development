@@ -9,7 +9,7 @@ import matplotlib.pyplot as plt
 import nibabel as nib
 
 from utils.const import ABIDE_I_MNI, ABIDE_II_MNI
-from utils.transforms import get_train_data_transform
+from utils.transforms import get_2D_data_transform
 
 
 def create_2D_image(path: Path) -> list:
@@ -36,7 +36,7 @@ if __name__ == "__main__":
     elif dataset_name == "II":
         sample_dicts = create_2D_image(ABIDE_II_MNI)
 
-    train_transform = get_train_data_transform()
+    train_transform = get_2D_data_transform()
     train_ds = Dataset(data=sample_dicts, transform=train_transform)
     train_loader = DataLoader(train_ds, batch_size=1, shuffle=True, num_workers=8)
 
@@ -76,18 +76,31 @@ if __name__ == "__main__":
                 axial = np.fliplr(axial)
 
                 # save as separate images
-                plt.imsave(
-                    f"/projectnb/ace-ig/ABIDE/ABIDE_{dataset_name}_2D/coronal/{train_batch_data['sample']}_{j}.png",
-                    sagittal,
-                    cmap="gray",
-                )
-                plt.imsave(
-                    f"/projectnb/ace-ig/ABIDE/ABIDE_{dataset_name}_2D/axial/{train_batch_data['sample']}_{j}.png",
+                # plt.imsave(
+                #     f"/projectnb/ace-ig/ABIDE/ABIDE_{dataset_name}_2D/coronal/{train_batch_data['sample']}_{j}.png",
+                #     sagittal,
+                #     cmap="gray",
+                # )
+                # plt.imsave(
+                #     f"/projectnb/ace-ig/ABIDE/ABIDE_{dataset_name}_2D/axial/{train_batch_data['sample']}_{j}.png",
+                #     coronal,
+                #     cmap="gray",
+                # )
+                # plt.imsave(
+                #     f"/projectnb/ace-ig/ABIDE/ABIDE_{dataset_name}_2D/sagittal/{train_batch_data['sample']}_{j}.png",
+                #     axial,
+                #     cmap="gray",
+                # )
+                # save as npy files
+                # np.save(
+                #     f"/projectnb/ace-ig/ABIDE/ABIDE_{dataset_name}_2D/coronal/{train_batch_data['sample']}_{j}.npy",
+                #     sagittal,
+                # )
+                np.save(
+                    f"/projectnb/ace-ig/ABIDE/ABIDE_{dataset_name}_2D/axial/{train_batch_data['sample']}_{j}.npy",
                     coronal,
-                    cmap="gray",
                 )
-                plt.imsave(
-                    f"/projectnb/ace-ig/ABIDE/ABIDE_{dataset_name}_2D/sagittal/{train_batch_data['sample']}_{j}.png",
-                    axial,
-                    cmap="gray",
-                )
+                # np.savez_compressed(
+                #     f"/projectnb/ace-ig/ABIDE/ABIDE_{dataset_name}_2D/sagittal/{train_batch_data['sample']}_{j}.npz",
+                #     sagittal=axial,
+                # )

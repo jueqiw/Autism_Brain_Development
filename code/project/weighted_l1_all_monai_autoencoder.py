@@ -396,9 +396,11 @@ def load_data():
 
 
 class CustomAutoEncoder(nn.Module):
-    def __init__(self, spatial_dims, in_channels, out_channels, channels, strides, num_res_units):
+    def __init__(
+        self, spatial_dims, in_channels, out_channels, channels, strides, num_res_units
+    ):
         super().__init__()
-        
+
         # First layer with InstanceNorm and PReLU
         self.first_conv = Conv[Conv.CONV, spatial_dims](
             in_channels=in_channels,
@@ -407,9 +409,9 @@ class CustomAutoEncoder(nn.Module):
             stride=1,
             padding=1,
             norm=Norm.INSTANCE,
-            act="PRELU"
+            act="PRELU",
         )
-        
+
         # Base autoencoder (modify input channels since first layer is handled separately)
         self.autoencoder = AutoEncoder(
             spatial_dims=spatial_dims,
@@ -419,12 +421,13 @@ class CustomAutoEncoder(nn.Module):
             strides=strides,
             num_res_units=num_res_units,
         )
-        
+
     def forward(self, x):
         # Pass through first layer with InstanceNorm and PReLU
         x = self.first_conv(x)
         # Pass through rest of autoencoder
         return self.autoencoder(x)
+
 
 def main(hparams):
     original, transformed, jacobians = load_data()
@@ -443,9 +446,9 @@ def main(hparams):
         spatial_dims=2,
         in_channels=2,
         out_channels=1,
-        channels=channels, # "32,64,64"
-        strides=strides, # "2,2,1"
-        num_res_units=hparams.num_res_units, # 3
+        channels=channels,  # "32,64,64"
+        strides=strides,  # "2,2,1"
+        num_res_units=hparams.num_res_units,  # 3
     ).to(device)
 
     # Custom initialization to prevent zero outputs

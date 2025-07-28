@@ -185,4 +185,3 @@ if __name__ == "__main__":
                     f"dispfield_{digits}_{j}.npz",
                     axial=axial,
                 )
-

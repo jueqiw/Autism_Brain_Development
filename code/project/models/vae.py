@@ -45,8 +45,6 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
             num_res_units=num_res_units,
         )
 
-        print(f"architecture: {self.base_autoencoder}")
-
         if pretrained_path:
             self._load_and_adapt_pretrained_weights(pretrained_path)
 
@@ -98,35 +96,25 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
 
     def _load_and_adapt_pretrained_weights(self, pretrained_path):
         """Load pretrained weights and adapt first conv layer from 2-channel to 1-channel"""
-        print(f"Loading pretrained weights from {pretrained_path}")
 
         pretrained_state_dict = torch.load(pretrained_path, map_location="cpu")
 
         adapted_state_dict = {}
+        for key in sorted(pretrained_state_dict.keys()):
+            if "encode.encode_0" in key:
+                shape = pretrained_state_dict[key].shape
+                print(f"  {key}: {shape}")
 
-        # Adapt all layers that depend on input channels (2->1)
-        layers_to_adapt = [
-            "encode.encode_0.conv.unit0.conv.weight",
-            "encode.encode_0.residual.weight",  # Residual connection also needs adaptation
-        ]
-
-        for key in layers_to_adapt:
-            if key in pretrained_state_dict:
-                original_weights = pretrained_state_dict[key]
-                print(f"Original {key} shape: {original_weights.shape}")
-
-                # Check if this layer actually has channel dimension that needs adaptation
-                if len(original_weights.shape) >= 2 and original_weights.shape[1] == 2:
-                    adapted_weights = original_weights.mean(dim=1, keepdim=True)
-                    print(f"Adapted {key} shape: {adapted_weights.shape}")
-                    adapted_state_dict[key] = adapted_weights
-                else:
-                    print(f"Skipping {key} - doesn't need channel adaptation")
-                    adapted_state_dict[key] = original_weights
-
-        # Copy all other weights unchanged
         for key, value in pretrained_state_dict.items():
-            if key not in layers_to_adapt:
+            if (
+                len(value.shape) >= 2
+                and value.shape[1] == 2
+                and "weight" in key
+                and ("conv" in key or "residual" in key)
+            ):
+                adapted_weights = value.mean(dim=1, keepdim=True)
+                adapted_state_dict[key] = adapted_weights
+            else:
                 adapted_state_dict[key] = value
 
         try:
@@ -138,11 +126,7 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
             if unexpected_keys:
                 print(f"Unexpected keys: {unexpected_keys}")
 
-            # Verify the first conv layer has correct shape
-            first_conv_weight = (
-                self.base_autoencoder.encode.encode_0.conv.unit0.conv.weight
-            )
-            print(f"Loaded first conv weight shape: {first_conv_weight.shape}")
+            print("Pretrained weights loaded and adapted successfully !")
 
         except Exception as e:
             print(f"Error loading adapted weights: {e}")
@@ -158,11 +142,22 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
 
     def set_decoder_layer_trainable(self, layer_idx, trainable=True):
         """Set specific decoder layer as trainable or frozen"""
-        layer_name = f"decode_{layer_idx}"
-        if hasattr(self.decoder_backbone, layer_name):
-            layer = getattr(self.decoder_backbone, layer_name)
-            for param in layer.parameters():
-                param.requires_grad = trainable
+        if layer_idx == -1:
+            # Set final decoder layer (last layer) as trainable
+            decoder_layers = list(self.decoder_backbone.named_children())
+            if decoder_layers:
+                final_layer_name, final_layer = decoder_layers[-1]
+                for param in final_layer.parameters():
+                    param.requires_grad = trainable
+                print(
+                    f"Set final decoder layer '{final_layer_name}' trainable: {trainable}"
+                )
+        else:
+            layer_name = f"decode_{layer_idx}"
+            if hasattr(self.decoder_backbone, layer_name):
+                layer = getattr(self.decoder_backbone, layer_name)
+                for param in layer.parameters():
+                    param.requires_grad = trainable
 
     def freeze_pretrained_encoder(self):
         """Freeze all pretrained encoder layers except the first conv"""
@@ -172,9 +167,11 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
         self.set_encoder_layer_trainable(0, trainable=True)
 
     def freeze_pretrained_decoder(self):
-        """Freeze all pretrained decoder layers"""
+        """Freeze all pretrained decoder layers except the final layer"""
         for param in self.decoder_backbone.parameters():
             param.requires_grad = False
+        # Keep final decoder layer trainable for better reconstruction
+        self.set_decoder_layer_trainable(-1, trainable=True)  # Final decoder layer
 
     def unfreeze_encoder_layer_by_layer(self, stage):
         """Gradually unfreeze encoder layers from deeper to shallower"""
@@ -191,21 +188,92 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
 
     def get_parameter_groups(self, new_lr=1e-3, pretrained_lr=1e-4, weight_decay=1e-4):
         """Get parameter groups with different learning rates and regularization"""
-        print(
-            "Creating simple parameter group - using single learning rate for all trainable parameters"
-        )
+        print("Creating parameter groups with different learning rates")
 
-        # Collect all trainable parameters
-        all_trainable_params = []
+        # Group 1: New VAE components (highest LR)
+        new_component_params = []
+        new_component_names = [
+            "fc_z_mean",
+            "fc_z_logvar",
+            "fc_age_mean",
+            "fc_age_logvar",
+            "fc_latent_to_bottleneck",
+            "additional_encoder",
+            "additional_decoder",
+            "age_to_prior",
+        ]
+
+        # Group 2: Final decoder layer (high LR)
+        final_decoder_params = []
+
+        # Group 3: Other pretrained components (low LR)
+        other_pretrained_params = []
+
         for name, param in self.named_parameters():
-            if param.requires_grad:
-                print(f"Trainable param: {name}, shape: {param.shape}")
-                all_trainable_params.append(param)
+            if not param.requires_grad:
+                continue
 
-        print(f"Total trainable parameters: {len(all_trainable_params)}")
+            # Check if it's a new VAE component
+            if any(comp_name in name for comp_name in new_component_names):
+                new_component_params.append(param)
+            # Check if it's the final decoder layer - identify dynamically
+            elif "decoder_backbone" in name:
+                # Get the final decoder layer name dynamically
+                decoder_layers = list(self.decoder_backbone.named_children())
+                if decoder_layers:
+                    final_layer_name = decoder_layers[-1][0]
+                    if final_layer_name in name:
+                        final_decoder_params.append(param)
+                    else:
+                        other_pretrained_params.append(param)
+                else:
+                    other_pretrained_params.append(param)
+            # Everything else that's trainable
+            else:
+                other_pretrained_params.append(param)
 
-        # Return single parameter group for now to avoid tensor comparison issues
-        return [{"params": all_trainable_params, "lr": new_lr, "weight_decay": 0.0}]
+        param_groups = []
+
+        if new_component_params:
+            param_groups.append(
+                {
+                    "params": new_component_params,
+                    "lr": new_lr,
+                    "weight_decay": 0.0,
+                    "name": "new_components",
+                }
+            )
+            print(
+                f"New components: {len(new_component_params)} parameters with LR {new_lr}"
+            )
+
+        if final_decoder_params:
+            param_groups.append(
+                {
+                    "params": final_decoder_params,
+                    "lr": new_lr * 0.8,  # Slightly lower than new components
+                    "weight_decay": weight_decay * 0.5,
+                    "name": "final_decoder",
+                }
+            )
+            print(
+                f"Final decoder: {len(final_decoder_params)} parameters with LR {new_lr * 0.8}"
+            )
+
+        if other_pretrained_params:
+            param_groups.append(
+                {
+                    "params": other_pretrained_params,
+                    "lr": pretrained_lr,
+                    "weight_decay": weight_decay,
+                    "name": "pretrained",
+                }
+            )
+            print(
+                f"Other pretrained: {len(other_pretrained_params)} parameters with LR {pretrained_lr}"
+            )
+
+        return param_groups
 
     def _determine_feature_sizes(self):
         """Determine the bottleneck feature size by running a dummy forward pass"""
@@ -281,7 +349,6 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
         return reconstruction
 
     def forward(self, x, age=None):
-        """Full forward pass"""
         # Encode
         z_mean, z_logvar, z, age_mean, age_logvar, age_pred = self.encode(x)
 
