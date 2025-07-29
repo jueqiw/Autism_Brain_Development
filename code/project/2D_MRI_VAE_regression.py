@@ -45,6 +45,24 @@ os.environ["MKL_NUM_THREADS"] = "8"
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
+def create_one_hot_encoding(dx_group):
+    """Create one-hot encoded conditional inputs for diagnosis
+
+    Args:
+        dx_group: 0=ASD, 1=Control
+
+    Returns:
+        one_hot: 1D numpy array with one-hot encoding (2 channels)
+    """
+    # Only 2 channels: ASD and Control
+    one_hot = np.zeros(2, dtype=np.float32)
+
+    # Diagnosis encoding: 0=ASD, 1=Control
+    one_hot[dx_group] = 1.0
+
+    return one_hot
+
+
 def get_data_transforms():
     """Create MONAI transforms for data preprocessing with intensity normalization"""
     return Compose(
@@ -56,19 +74,20 @@ def get_data_transforms():
                 reader=NibabelReader(),
             ),
             Resized(keys=["image"], spatial_size=(192, 192)),
-            ToTensord(keys=["image", "age"]),
+            ToTensord(keys=["image", "age", "dx_group", "dataset_num"]),
         ]
     )
 
 
 class MRIAgeDataset(Dataset):
-    """Custom dataset class that wraps MONAI CacheDataset for training"""
+    """Custom dataset class that wraps MONAI CacheDataset for training with conditional input"""
 
-    def __init__(self, cached_dataset, indices=None):
+    def __init__(self, cached_dataset, indices=None, use_conditional=True):
         self.cached_dataset = cached_dataset
         self.indices = (
             indices if indices is not None else list(range(len(cached_dataset)))
         )
+        self.use_conditional = use_conditional
 
     def __len__(self):
         return len(self.indices)
@@ -78,11 +97,35 @@ class MRIAgeDataset(Dataset):
         actual_idx = self.indices[idx]
         sample = self.cached_dataset[actual_idx]
 
-        img = sample["image"]  # Already preprocessed tensor
+        img = sample["image"]  # Already preprocessed tensor (1, H, W)
+
         # Normalize age to [0, 1] range (assuming ages are 0-21)
         age_normalized = sample["age"] / 21.0
         age = torch.tensor([age_normalized], dtype=torch.float32)
-        return img, age
+
+        if self.use_conditional:
+            # Create one-hot conditional input
+            dx_group = int(sample["dx_group"])  # 0=ASD, 1=Control
+
+            # Get one-hot encoding
+            one_hot = create_one_hot_encoding(dx_group)
+
+            # Convert to tensor and create channel maps
+            one_hot_tensor = torch.from_numpy(one_hot)  # Shape: (2,)
+            H, W = img.shape[1], img.shape[2]
+
+            # Create one-hot channel maps by broadcasting to image size
+            conditional_channels = (
+                one_hot_tensor.unsqueeze(-1).unsqueeze(-1).expand(-1, H, W)
+            )  # Shape: (2, H, W)
+
+            # Concatenate original image with conditional channels
+            # Result: (1 + 2, H, W) = (3, H, W)
+            img_with_conditional = torch.cat([img, conditional_channels], dim=0)
+
+            return img_with_conditional, age
+        else:
+            return img, age
 
 
 # Loss function combining reconstruction, KL, and label (age) loss
@@ -100,8 +143,9 @@ def vae_loss_fn(
     kl_weight=0.01,
     age_weight=10.0,
 ):
-    # Reconstruction loss (MAE)
-    recon_loss = F.l1_loss(x_recon, x, reduction="mean")
+
+    # save the target image
+    recon_loss = F.l1_loss(x_recon, x[:, 0, :, :].unsqueeze(1), reduction="mean")
 
     # KL divergence between posterior z and prior pz
     kl_loss = (
@@ -126,27 +170,48 @@ def vae_loss_fn(
 
 
 # Loading all data (same logic as TF version)
-def get_ages(sub_id, dataset_num):
+def get_phenotypic_data(sub_id, dataset_num):
+    """Get age, diagnosis group, and site info for a subject"""
     sub_id = int(sub_id)
     if dataset_num == 1:
         df = pd.read_csv(ABIDE_PATH / "Phenotypic_V1_0b.csv")
-        age = df[(df["SUB_ID"] == sub_id)]["AGE_AT_SCAN"].values[0]
+        row = df[(df["SUB_ID"] == sub_id)]
+        if row.empty:
+            return None
+        age = row["AGE_AT_SCAN"].values[0]
         if age > 21:
             return None
+        dx_group = (
+            int(row["DX_GROUP"].values[0]) - 1
+        )  # Convert to 0-indexed (0=ASD, 1=Control)
+        site_id = row["SITE_ID"].values[0] if "SITE_ID" in row.columns else "Unknown"
+        return age, dx_group, site_id
     elif dataset_num == 2:
         df = pd.read_csv(
             ABIDE_PATH / "ABIDEII_Composite_Phenotypic.csv", encoding="cp1252"
         )
-        if df[(df["SUB_ID"] == sub_id)].empty:  #
+        row = df[(df["SUB_ID"] == sub_id)]
+        if row.empty:
             return None
-        age = df[(df["SUB_ID"] == sub_id)]["AGE_AT_SCAN "].values[0]  # note extra space
+        age = row["AGE_AT_SCAN "].values[0]  # note extra space
         if age > 21:
             return None
-    return age
+        dx_group = (
+            int(row["DX_GROUP"].values[0]) - 1
+        )  # Convert to 0-indexed (0=ASD, 1=Control)
+        site_id = row["SITE_ID"].values[0] if "SITE_ID" in row.columns else "Unknown"
+        return age, dx_group, site_id
+    return None
+
+
+def get_ages(sub_id, dataset_num):
+    """Backward compatibility function"""
+    result = get_phenotypic_data(sub_id, dataset_num)
+    return result[0] if result is not None else None
 
 
 def prepare_data_dicts():
-    """Prepare data dictionaries for MONAI CacheDataset"""
+    """Prepare data dictionaries for MONAI CacheDataset with phenotypic data"""
     folder_paths = [
         ABIDE_I_2D_REGRESSION / "axial",
         ABIDE_II_2D_REGRESSION / "axial",
@@ -164,11 +229,12 @@ def prepare_data_dicts():
             if filename.endswith(".npy"):
                 subject_id = filename[2:7]
                 dataset_num = 1 if "ABIDE_I_2D" in str(folder_path) else 2
-                age = get_ages(subject_id, dataset_num)
+                phenotypic_data = get_phenotypic_data(subject_id, dataset_num)
 
-                if age is None:
+                if phenotypic_data is None:
                     continue
 
+                age, dx_group, site_id = phenotypic_data
                 if age < 21:
                     img_path = str(folder_path / filename)
 
@@ -176,8 +242,10 @@ def prepare_data_dicts():
                         {
                             "image": img_path,
                             "age": float(age),
+                            "dx_group": int(dx_group),  # 0=ASD, 1=Control
+                            "dataset_num": int(dataset_num),  # 1=ABIDE-I, 2=ABIDE-II
+                            "site_id": site_id,
                             "subject_id": subject_id,
-                            "dataset_num": dataset_num,
                         }
                     )
 
@@ -211,8 +279,14 @@ def log_vae_images(writer, inputs, reconstructions, ages, epoch, prefix=""):
     """
     sample_idx = 0
 
-    # Get first sample
-    input_img = inputs[sample_idx : sample_idx + 1]  # (1, 1, H, W)
+    # Get first sample - handle 3-channel input by using only first channel
+    if inputs.shape[1] == 3:
+        input_img = inputs[
+            sample_idx : sample_idx + 1, 0:1, :, :
+        ]  # Take only first channel (brain image)
+    else:
+        input_img = inputs[sample_idx : sample_idx + 1]  # (1, 1, H, W)
+
     recon_img = reconstructions[sample_idx : sample_idx + 1]  # (1, 1, H, W)
     age = ages[sample_idx].item()
 
@@ -231,9 +305,8 @@ def log_vae_images(writer, inputs, reconstructions, ages, epoch, prefix=""):
 
     plt.tight_layout()
 
-    title = (
-        f"{prefix}_VAE_Images_epoch_{epoch}" if prefix else f"VAE_Images_epoch_{epoch}"
-    )
+    # Simplified title with just epoch number
+    title = f"{prefix}_Epoch_{epoch+1}"
     writer.add_figure(title, fig, epoch)
     plt.close(fig)
 
@@ -411,13 +484,16 @@ def train_epoch(
             )
 
     avg_train_loss = total_train_loss / len(train_loader)
-    avg_recon_loss = total_recon_loss / len(train_loader)
-    avg_kl_loss = total_kl_loss / len(train_loader)
-    avg_age_loss = total_age_loss / len(train_loader)
+    avg_train_recon = total_recon_loss / len(train_loader)
+    avg_train_kl = total_kl_loss / len(train_loader)
+    avg_train_age = total_age_loss / len(train_loader)
 
     # Validation phase
     model.eval()
     total_val_loss = 0
+    total_val_recon = 0
+    total_val_kl = 0
+    total_val_age = 0
     sample_inputs = sample_reconstructions = sample_ages = None
 
     with torch.no_grad():
@@ -436,7 +512,7 @@ def train_epoch(
                 age_pred_val,
             ) = model(imgs_val, ages_val)
 
-            val_loss, _, _, _ = vae_loss_fn(
+            val_loss, val_recon, val_kl, val_age = vae_loss_fn(
                 imgs_val,
                 recon_val,
                 z_mean_val,
@@ -448,6 +524,9 @@ def train_epoch(
                 ages_val,
             )
             total_val_loss += val_loss.item()
+            total_val_recon += val_recon.item()
+            total_val_kl += val_kl.item()
+            total_val_age += val_age.item()
 
             # Store samples for logging
             if batch_idx == 0 and (epoch + 1) % 10 == 0:
@@ -456,15 +535,24 @@ def train_epoch(
                 sample_ages = ages_val[:4].detach().cpu()
 
     avg_val_loss = total_val_loss / len(val_loader)
+    avg_val_recon = total_val_recon / len(val_loader)
+    avg_val_kl = total_val_kl / len(val_loader)
+    avg_val_age = total_val_age / len(val_loader)
 
-    # Log metrics to TensorBoard
-    writer.add_scalar(f"Loss/{stage_name}_Train_Total", avg_train_loss, epoch)
-    writer.add_scalar(f"Loss/{stage_name}_Train_Reconstruction", avg_recon_loss, epoch)
-    writer.add_scalar(f"Loss/{stage_name}_Train_KL", avg_kl_loss, epoch)
-    writer.add_scalar(f"Loss/{stage_name}_Train_Age", avg_age_loss, epoch)
-    writer.add_scalar(f"Loss/{stage_name}_Validation", avg_val_loss, epoch)
+    # Log metrics to TensorBoard - separate training and validation plots
+    # Training losses
+    writer.add_scalar("train_loss/total", avg_train_loss, epoch)
+    writer.add_scalar("train_loss/reconstruction", avg_train_recon, epoch)
+    writer.add_scalar("train_loss/kl_divergence", avg_train_kl, epoch)
+    writer.add_scalar("train_loss/age_regression", avg_train_age, epoch)
 
-    # Log images every 10 epochs
+    # Validation losses
+    writer.add_scalar("val_loss/total", avg_val_loss, epoch)
+    writer.add_scalar("val_loss/reconstruction", avg_val_recon, epoch)
+    writer.add_scalar("val_loss/kl_divergence", avg_val_kl, epoch)
+    writer.add_scalar("val_loss/age_regression", avg_val_age, epoch)
+
+    # Log images every 10 epochs - simplified titles with just epoch
     if (epoch + 1) % 10 == 0:
         if train_sample_for_logging is not None:
             sample_train_inputs, sample_train_recons, sample_train_ages = (
@@ -476,7 +564,7 @@ def train_epoch(
                 sample_train_recons,
                 sample_train_ages,
                 epoch,
-                prefix=f"{stage_name}_Train",
+                prefix="Train",
             )
 
         if sample_inputs is not None:
@@ -486,10 +574,10 @@ def train_epoch(
                 sample_reconstructions,
                 sample_ages,
                 epoch,
-                prefix=f"{stage_name}_Val",
+                prefix="Validation",
             )
 
-    return avg_train_loss, avg_val_loss, avg_recon_loss, avg_kl_loss, avg_age_loss
+    return avg_train_loss, avg_val_loss, avg_train_recon, avg_train_kl, avg_train_age
 
 
 # Original training function (kept for compatibility)
@@ -734,9 +822,9 @@ def main(hparams):
         f"Samples - Train: {len(train_indices)}, Val: {len(val_indices)}, Test: {len(test_indices)}"
     )
 
-    train_dataset = MRIAgeDataset(cached_dataset, train_indices)
-    val_dataset = MRIAgeDataset(cached_dataset, val_indices)
-    test_dataset = MRIAgeDataset(cached_dataset, test_indices)
+    train_dataset = MRIAgeDataset(cached_dataset, train_indices, use_conditional=True)
+    val_dataset = MRIAgeDataset(cached_dataset, val_indices, use_conditional=True)
+    test_dataset = MRIAgeDataset(cached_dataset, test_indices, use_conditional=True)
 
     train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)

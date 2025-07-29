@@ -27,26 +27,30 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
         latent_dim=32,
         age_latent_dim=16,
         pretrained_path=None,
+        input_channels=3,  # 1 original + 2 conditional channels
     ):
         super().__init__()
 
         self.latent_dim = latent_dim
         self.age_latent_dim = age_latent_dim
+        self.input_channels = input_channels
 
         self.channels = channels
         self.strides = strides
         self.num_res_units = num_res_units
+        # Create autoencoder with 3 input channels from scratch
         self.base_autoencoder = AutoEncoder(
             spatial_dims=2,
-            in_channels=1,
-            out_channels=1,
+            in_channels=input_channels,  # Use configurable input channels (3)
+            out_channels=1,  # Still output 1 channel (reconstructed brain image)
             channels=channels,
             strides=strides,
             num_res_units=num_res_units,
         )
 
+        # Load pretrained weights for the encoder/decoder layers (except first conv)
         if pretrained_path:
-            self._load_and_adapt_pretrained_weights(pretrained_path)
+            self._load_compatible_pretrained_weights(pretrained_path)
 
         # Extract encoder and decoder
         self.encoder_backbone = self.base_autoencoder.encode
@@ -97,12 +101,31 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
 
         # Final trainable layer to match pretrained decoder input size
         self.interpolate_to_decoder = nn.Sequential(
-            nn.ConvTranspose2d(64, 64, kernel_size=4, stride=2, padding=1),  # Should get close to 48x48
+            nn.ConvTranspose2d(
+                64, 64, kernel_size=4, stride=2, padding=1
+            ),  # Should get close to 48x48
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
             nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),  # Refine features
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
+        )
+        
+        # Final upsampling layers to match input size (128x128 -> 192x192)
+        # Two-stage upsampling: 128 -> 160 -> 192
+        self.final_upsample = nn.Sequential(
+            # First ConvTranspose: 128x128 -> 160x160 (1.25x)
+            nn.ConvTranspose2d(1, 32, kernel_size=3, stride=1, padding=0, output_padding=0),  # 128 -> 130
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(32, 16, kernel_size=4, stride=1, padding=1, output_padding=0),  # 130 -> 131
+            nn.BatchNorm2d(16),
+            nn.ReLU(inplace=True),
+            # Second ConvTranspose: 160x160 -> 192x192 (1.2x)
+            nn.ConvTranspose2d(16, 8, kernel_size=5, stride=1, padding=0, output_padding=0),  # 131 -> 135
+            nn.BatchNorm2d(8),
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(8, 1, kernel_size=58, stride=1, padding=0, output_padding=0),  # 135 -> 192
         )
 
         # NOW calculate feature sizes with the additional encoder
@@ -120,43 +143,56 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
         # Age-dependent prior generator
         self.age_to_prior = AgePriorGenerator(latent_dim)
 
-    def _load_and_adapt_pretrained_weights(self, pretrained_path):
-        """Load pretrained weights and adapt first conv layer from 2-channel to 1-channel"""
+    def _load_compatible_pretrained_weights(self, pretrained_path):
+        """Load pretrained weights for compatible layers (skip first conv layer)"""
 
         pretrained_state_dict = torch.load(pretrained_path, map_location="cpu")
 
-        adapted_state_dict = {}
-        for key in sorted(pretrained_state_dict.keys()):
-            if "encode.encode_0" in key:
-                shape = pretrained_state_dict[key].shape
-                print(f"  {key}: {shape}")
+        # Get current model state dict
+        current_state_dict = self.base_autoencoder.state_dict()
+
+        compatible_weights = {}
+        skipped_layers = []
 
         for key, value in pretrained_state_dict.items():
-            if (
-                len(value.shape) >= 2
-                and value.shape[1] == 2
-                and "weight" in key
-                and ("conv" in key or "residual" in key)
-            ):
-                adapted_weights = value.mean(dim=1, keepdim=True)
-                adapted_state_dict[key] = adapted_weights
+            if key in current_state_dict:
+                current_shape = current_state_dict[key].shape
+                pretrained_shape = value.shape
+
+                # Skip first encoder layer due to channel mismatch
+                if (
+                    "encode_0" in key
+                    and len(pretrained_shape) >= 2
+                    and pretrained_shape[1] != current_shape[1]
+                ):
+                    skipped_layers.append(key)
+                    continue
+
+                # Load compatible layers
+                if current_shape == pretrained_shape:
+                    compatible_weights[key] = value
+                else:
+                    skipped_layers.append(key)
             else:
-                adapted_state_dict[key] = value
+                skipped_layers.append(key)
 
         try:
+            # Load compatible weights
             missing_keys, unexpected_keys = self.base_autoencoder.load_state_dict(
-                adapted_state_dict, strict=False
+                compatible_weights, strict=False
             )
-            if missing_keys:
-                print(f"Missing keys: {missing_keys}")
-            if unexpected_keys:
-                print(f"Unexpected keys: {unexpected_keys}")
 
-            print("Pretrained weights loaded and adapted successfully !")
+            print(f"Loaded {len(compatible_weights)} compatible pretrained weights")
+            print(
+                f"Skipped {len(skipped_layers)} incompatible layers (including first conv)"
+            )
+            print(
+                f"First conv layer will use random initialization for 3-channel input"
+            )
 
         except Exception as e:
-            print(f"Error loading adapted weights: {e}")
-            print("Falling back to random initialization")
+            print(f"Error loading pretrained weights: {e}")
+            print("Using random initialization for all layers")
 
     def set_encoder_layer_trainable(self, layer_idx, trainable=True):
         """Set specific encoder layer as trainable or frozen"""
@@ -216,7 +252,10 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
         """Get parameter groups with different learning rates and regularization"""
         print("Creating parameter groups with different learning rates")
 
-        # Group 1: New VAE components (highest LR)
+        # Group 1: First encoder layer (highest LR - randomly initialized for 3-channel input)
+        first_encoder_params = []
+        
+        # Group 2: New VAE components (highest LR)
         new_component_params = []
         new_component_names = [
             "fc_z_mean",
@@ -226,21 +265,26 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
             "fc_latent_to_bottleneck",
             "additional_encoder",
             "additional_decoder",
+            "interpolate_to_decoder",
+            "final_upsample",
             "age_to_prior",
         ]
 
-        # Group 2: Final decoder layer (high LR)
+        # Group 3: Final decoder layer (high LR)
         final_decoder_params = []
 
-        # Group 3: Other pretrained components (low LR)
+        # Group 4: Other pretrained components (low LR)
         other_pretrained_params = []
 
         for name, param in self.named_parameters():
             if not param.requires_grad:
                 continue
 
+            # Check if it's the first encoder layer (needs highest LR)
+            if "encoder_backbone.encode_0" in name:
+                first_encoder_params.append(param)
             # Check if it's a new VAE component
-            if any(comp_name in name for comp_name in new_component_names):
+            elif any(comp_name in name for comp_name in new_component_names):
                 new_component_params.append(param)
             # Check if it's the final decoder layer - identify dynamically
             elif "decoder_backbone" in name:
@@ -259,6 +303,19 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
                 other_pretrained_params.append(param)
 
         param_groups = []
+
+        if first_encoder_params:
+            param_groups.append(
+                {
+                    "params": first_encoder_params,
+                    "lr": new_lr * 1.2,  # Highest LR for conditional input learning
+                    "weight_decay": 0.0,
+                    "name": "first_encoder",
+                }
+            )
+            print(
+                f"First encoder layer: {len(first_encoder_params)} parameters with LR {new_lr * 1.2}"
+            )
 
         if new_component_params:
             param_groups.append(
@@ -303,7 +360,7 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
 
     def _determine_feature_sizes(self):
         """Determine the bottleneck feature size by running a dummy forward pass"""
-        dummy_input = torch.randn(1, 1, 192, 192)
+        dummy_input = torch.randn(1, self.input_channels, 192, 192)
 
         with torch.no_grad():
             # Get encoder output (bottleneck features from pretrained encoder)
@@ -369,10 +426,13 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
         # Interpolate to match pretrained decoder input size (48x48)
         decoder_input = self.interpolate_to_decoder(expanded_features)
 
-        # Use pretrained decoder
+        # Use pretrained decoder (outputs ~128x128)
         reconstruction = self.decoder_backbone(decoder_input)
 
-        return reconstruction
+        # Final upsampling to match input size (128x128 -> 192x192)
+        final_output = self.final_upsample(reconstruction)
+
+        return final_output
 
     def forward(self, x, age=None):
         # Encode
@@ -497,6 +557,9 @@ def create_vae_model(hparams, pretrained_path=None):
         strides=(2, 2, 1),
         num_res_units=3,
         latent_dim=getattr(hparams, "latent_dim", 32),
+        input_channels=getattr(
+            hparams, "input_channels", 3
+        ),  # Default 3 for conditional
         pretrained_path=pretrained_path,
     )
 

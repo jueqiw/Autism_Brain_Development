@@ -14,7 +14,7 @@ source /projectnb/ace-genetics/jueqiw/software/venvs/monai/bin/activate
 
 cd /project/ace-genetics/jueqiw/code/Autism_Brain_Development/code/project/
 
- python 2D_MRI_VAE_regression.py \
+python 2D_MRI_VAE_regression.py \
     --recon_weight 10.0 \
     --kl_weight 0.005 \
     --age_weight 1.0 \
@@ -23,7 +23,7 @@ cd /project/ace-genetics/jueqiw/code/Autism_Brain_Development/code/project/
     --batch_size 32 \
     --n_epochs 200 \
     --stage_transition_epoch 50 \
-    --experiment_name "vae_better_reconstruction_v1"
+    --experiment_name "vae_better_reconstruction_v1_with_conditional"
 
 # python3 /project/ace-genetics/jueqiw/code/Autism_Brain_Development/code/project/weighted_l1_all_monai_autoencoder.py \
 #     --loss_type simple_l1 \
