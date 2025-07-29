@@ -79,13 +79,26 @@ class MRIAgeDataset(Dataset):
         sample = self.cached_dataset[actual_idx]
 
         img = sample["image"]  # Already preprocessed tensor
-        age = torch.tensor([sample["age"]], dtype=torch.float32)
+        # Normalize age to [0, 1] range (assuming ages are 0-21)
+        age_normalized = sample["age"] / 21.0
+        age = torch.tensor([age_normalized], dtype=torch.float32)
         return img, age
 
 
 # Loss function combining reconstruction, KL, and label (age) loss
 def vae_loss_fn(
-    x, x_recon, z_mean, z_log_var, pz_mean, pz_log_var, r_mean, r_log_var, r
+    x,
+    x_recon,
+    z_mean,
+    z_log_var,
+    pz_mean,
+    pz_log_var,
+    r_mean,
+    r_log_var,
+    r,
+    recon_weight=1.0,
+    kl_weight=0.01,
+    age_weight=10.0,
 ):
     # Reconstruction loss (MAE)
     recon_loss = F.l1_loss(x_recon, x, reduction="mean")
@@ -100,11 +113,13 @@ def vae_loss_fn(
     )
     kl_loss = -0.5 * kl_loss.sum(dim=1).mean()
 
-    # Label loss (age prediction)
-    label_loss = 0.5 * ((r_mean - r).pow(2) / r_log_var.exp()) + 0.5 * r_log_var
-    label_loss = label_loss.mean()
+    # Simple age regression loss (MSE) - more stable than probabilistic loss
+    age_loss = F.mse_loss(r_mean, r, reduction="mean")
 
-    return recon_loss + kl_loss + label_loss
+    # Combined weighted loss
+    total_loss = recon_weight * recon_loss + kl_weight * kl_loss + age_weight * age_loss
+
+    return total_loss, recon_loss, kl_loss, age_loss
 
 
 # Augmentation functions removed - no data augmentation used
@@ -134,7 +149,7 @@ def prepare_data_dicts():
     """Prepare data dictionaries for MONAI CacheDataset"""
     folder_paths = [
         ABIDE_I_2D_REGRESSION / "axial",
-        # ABIDE_II_2D_REGRESSION / "axial",
+        ABIDE_II_2D_REGRESSION / "axial",
     ]
 
     data_dicts = []
@@ -238,12 +253,21 @@ def train_fold_two_stage(
         log_dir = os.path.join(log_dir, f"{hparams.experiment_name}_two_stage")
     writer = SummaryWriter(log_dir=log_dir)
 
-    warmup_epochs = epochs // 4  # 25% for warm-up
+    # Get stage transition epoch from hyperparameters
+    stage_transition_epoch = getattr(hparams, "stage_transition_epoch", 40)
+    warmup_epochs = min(
+        stage_transition_epoch, epochs
+    )  # Warm-up until transition epoch or total epochs
     finetune_epochs = epochs - warmup_epochs
-    stage_epochs = finetune_epochs // 3  # Divide fine-tuning into 3 stages
+    stage_epochs = (
+        max(1, finetune_epochs // 3) if finetune_epochs > 0 else 1
+    )  # Divide fine-tuning into 3 stages
 
     print(
         f"Two-stage training: {warmup_epochs} warm-up + {finetune_epochs} fine-tuning epochs"
+    )
+    print(
+        f"Stage transition configured for epoch {stage_transition_epoch}, actual transition at epoch {warmup_epochs}"
     )
 
     total_train_history = []
@@ -259,16 +283,24 @@ def train_fold_two_stage(
     optimizer = torch.optim.Adam(param_groups)
 
     for epoch in range(warmup_epochs):
-        train_loss, val_loss = train_epoch(
-            train_loader, val_loader, model, optimizer, writer, epoch, "warmup"
+        train_loss, val_loss, avg_recon_loss, avg_kl_loss, avg_age_loss = train_epoch(
+            train_loader, val_loader, model, optimizer, writer, epoch, "warmup", hparams
         )
         total_train_history.append(train_loss)
         total_val_history.append(val_loss)
 
         if (epoch + 1) % 10 == 0:
             print(
-                f"Warm-up Epoch {epoch+1}/{warmup_epochs} - Train: {train_loss:.6f} | Val: {val_loss:.6f}"
+                f"Warm-up Epoch {epoch+1}/{warmup_epochs} - Total: {train_loss:.6f} | Val: {val_loss:.6f}"
             )
+            print(
+                f"  Loss components - Recon: {avg_recon_loss:.6f}, KL: {avg_kl_loss:.6f}, Age: {avg_age_loss:.6f}"
+            )
+
+        # Early transition check - advance to next stage at configured epoch
+        if epoch + 1 >= stage_transition_epoch:
+            print(f"Advancing to fine-tuning stage at epoch {epoch + 1}")
+            break
 
     print("Stage 2: Gradual fine-tuning...")
 
@@ -290,7 +322,7 @@ def train_fold_two_stage(
         stage_end_epoch = min(warmup_epochs + stage * stage_epochs, epochs)
 
         for epoch in range(stage_start_epoch, stage_end_epoch):
-            train_loss, val_loss = train_epoch(
+            train_loss, val_loss, _, _, _ = train_epoch(
                 train_loader,
                 val_loader,
                 model,
@@ -298,6 +330,7 @@ def train_fold_two_stage(
                 writer,
                 epoch,
                 f"finetune_stage_{stage}",
+                hparams,
             )
             total_train_history.append(train_loss)
             total_val_history.append(val_loss)
@@ -311,7 +344,9 @@ def train_fold_two_stage(
     return model
 
 
-def train_epoch(train_loader, val_loader, model, optimizer, writer, epoch, stage_name):
+def train_epoch(
+    train_loader, val_loader, model, optimizer, writer, epoch, stage_name, hparams=None
+):
     """Single epoch training and validation"""
     model.train()
 
@@ -339,8 +374,12 @@ def train_epoch(train_loader, val_loader, model, optimizer, writer, epoch, stage
             age_pred,
         ) = model(imgs, ages)
 
-        # Compute VAE loss using local vae_loss_fn
-        total_loss = vae_loss_fn(
+        # Compute VAE loss using local vae_loss_fn with configurable weights
+        recon_weight = getattr(hparams, "recon_weight", 1.0)
+        kl_weight = getattr(hparams, "kl_weight", 0.01)
+        age_weight = getattr(hparams, "age_weight", 10.0)
+
+        total_loss, recon_loss, kl_loss, age_loss = vae_loss_fn(
             imgs,
             recon,
             z_mean,
@@ -350,8 +389,10 @@ def train_epoch(train_loader, val_loader, model, optimizer, writer, epoch, stage
             age_mean,
             age_logvar,
             ages,
+            recon_weight=recon_weight,
+            kl_weight=kl_weight,
+            age_weight=age_weight,
         )
-        recon_loss = kl_loss = age_loss = total_loss  # For logging purposes
 
         total_loss.backward()
         optimizer.step()
@@ -395,7 +436,7 @@ def train_epoch(train_loader, val_loader, model, optimizer, writer, epoch, stage
                 age_pred_val,
             ) = model(imgs_val, ages_val)
 
-            val_loss = vae_loss_fn(
+            val_loss, _, _, _ = vae_loss_fn(
                 imgs_val,
                 recon_val,
                 z_mean_val,
@@ -448,7 +489,7 @@ def train_epoch(train_loader, val_loader, model, optimizer, writer, epoch, stage
                 prefix=f"{stage_name}_Val",
             )
 
-    return avg_train_loss, avg_val_loss
+    return avg_train_loss, avg_val_loss, avg_recon_loss, avg_kl_loss, avg_age_loss
 
 
 # Original training function (kept for compatibility)
@@ -490,7 +531,7 @@ def train_fold(train_loader, val_loader, model, epochs, lr=1e-3, hparams=None):
                 age_pred,
             ) = model(imgs, ages)
 
-            total_loss = vae_loss_fn(
+            total_loss, recon_loss, kl_loss, age_loss = vae_loss_fn(
                 imgs,
                 recon,
                 z_mean,
@@ -501,7 +542,6 @@ def train_fold(train_loader, val_loader, model, epochs, lr=1e-3, hparams=None):
                 age_logvar,
                 ages,
             )
-            recon_loss = kl_loss = age_loss = total_loss  # For logging purposes
 
             total_loss.backward()
             optimizer.step()
@@ -553,7 +593,7 @@ def train_fold(train_loader, val_loader, model, epochs, lr=1e-3, hparams=None):
                     age_pred_val,
                 ) = model(imgs_val, ages_val)
 
-                val_loss = vae_loss_fn(
+                val_loss, _, _, _ = vae_loss_fn(
                     imgs_val,
                     recon_val,
                     z_mean_val,
@@ -631,14 +671,25 @@ def evaluate(val_loader, model):
             targets.append(ages.cpu().numpy())
     preds = np.concatenate(preds).squeeze()
     targets = np.concatenate(targets).squeeze()
-    mse = mean_squared_error(targets, preds)
-    r2 = r2_score(targets, preds)
-    return preds, targets, mse, r2
+
+    # Denormalize predictions and targets back to original age scale
+    preds_denorm = preds * 21.0
+    targets_denorm = targets * 21.0
+
+    mse = mean_squared_error(targets_denorm, preds_denorm)
+    r2 = r2_score(targets_denorm, preds_denorm)
+
+    print(
+        f"Age range - Predicted: [{preds_denorm.min():.1f}, {preds_denorm.max():.1f}], "
+        f"Actual: [{targets_denorm.min():.1f}, {targets_denorm.max():.1f}]"
+    )
+
+    return preds_denorm, targets_denorm, mse, r2
 
 
 def main(hparams):
     # Load cached dataset directly
-    cached_dataset = create_monai_dataset(cache_rate=0.05, num_workers=8)
+    cached_dataset = create_monai_dataset(cache_rate=1, num_workers=8)
     print(f"Loaded cached dataset with {len(cached_dataset)} samples")
 
     print("Splitting dataset by subjects into train/val/test (8:1:1)...")

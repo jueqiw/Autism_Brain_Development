@@ -254,3 +254,35 @@ def add_argument(parser: ArgumentParser):
         type=float,
         help="Dropout rate for the model",
     )
+    
+    # VAE training parameters
+    parser.add_argument(
+        "--stage_transition_epoch",
+        default=40,
+        type=int,
+        help="Epoch at which to transition from warm-up stage to fine-tuning stage in VAE training",
+    )
+    parser.add_argument(
+        "--latent_dim",
+        default=32,
+        type=int,
+        help="Latent dimension for VAE",
+    )
+    parser.add_argument(
+        "--recon_weight",
+        default=1.0,
+        type=float,
+        help="Weight for reconstruction loss in VAE",
+    )
+    parser.add_argument(
+        "--kl_weight", 
+        default=0.01,
+        type=float,
+        help="Weight for KL divergence loss in VAE",
+    )
+    parser.add_argument(
+        "--age_weight",
+        default=10.0,
+        type=float,
+        help="Weight for age regression loss in VAE",
+    )

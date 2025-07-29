@@ -60,23 +60,49 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
         # Additional encoder layer to compress the latent space
         # This will reduce the large bottleneck size to something manageable for VAE
         self.additional_encoder = nn.Sequential(
-            # Aggressive pooling to reduce 48x48 to 2x2 for small latent space
-            nn.AdaptiveAvgPool2d((2, 2)),  # 64 * 2 * 2 = 256
-            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
+            # First compression layer - reduce from 48x48 to 12x12
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),  # 48x48 -> 24x24
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            # Second compression layer
+            nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),  # 24x24 -> 12x12
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            # Final compression layer
+            nn.AdaptiveAvgPool2d((4, 4)),  # 12x12 -> 4x4, total: 256*4*4 = 4096
+            nn.Conv2d(256, 128, kernel_size=3, stride=1, padding=1),
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
         )
 
         # Corresponding decoder layer to upsample back
         self.additional_decoder = nn.Sequential(
-            nn.ConvTranspose2d(128, 64, kernel_size=3, stride=1, padding=1),
+            # First expansion layer
+            nn.ConvTranspose2d(128, 256, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(256),
+            nn.ReLU(inplace=True),
+            # Second expansion layer - from 4x4 to 12x12
+            nn.ConvTranspose2d(
+                256, 128, kernel_size=3, stride=2, padding=1, output_padding=1
+            ),  # 4x4 -> 8x8 -> adjust to 12x12
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            # Final expansion layer - from 12x12 to 24x24 then to 48x48
+            nn.ConvTranspose2d(
+                128, 64, kernel_size=3, stride=2, padding=1, output_padding=1
+            ),  # 12x12 -> 24x24
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
         )
 
-        # Final interpolation layer to match pretrained decoder input size
-        self.interpolate_to_decoder = nn.Upsample(
-            size=(48, 48), mode="bilinear", align_corners=False
+        # Final trainable layer to match pretrained decoder input size
+        self.interpolate_to_decoder = nn.Sequential(
+            nn.ConvTranspose2d(64, 64, kernel_size=4, stride=2, padding=1),  # Should get close to 48x48
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),  # Refine features
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
         )
 
         # NOW calculate feature sizes with the additional encoder
