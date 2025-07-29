@@ -42,7 +42,7 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
         self.base_autoencoder = AutoEncoder(
             spatial_dims=2,
             in_channels=input_channels,  # Use configurable input channels (3)
-            out_channels=1,  # Still output 1 channel (reconstructed brain image)
+            out_channels=1,  # Still output 1 channel (reconstructed brain image)``
             channels=channels,
             strides=strides,
             num_res_units=num_res_units,
@@ -72,29 +72,30 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
             nn.Conv2d(128, 256, kernel_size=3, stride=2, padding=1),  # 24x24 -> 12x12
             nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
-            # Final compression layer
-            nn.AdaptiveAvgPool2d((4, 4)),  # 12x12 -> 4x4, total: 256*4*4 = 4096
-            nn.Conv2d(256, 128, kernel_size=3, stride=1, padding=1),
+            # Final compression layer - replace AdaptiveAvgPool2d with convolution
+            nn.Conv2d(256, 128, kernel_size=3, stride=3, padding=0),  # 12x12 -> 4x4
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
         )
 
         # Corresponding decoder layer to upsample back
         self.additional_decoder = nn.Sequential(
-            # First expansion layer
-            nn.ConvTranspose2d(128, 256, kernel_size=3, stride=1, padding=1),
+            # First expansion layer - reverse of the compression
+            nn.ConvTranspose2d(
+                128, 256, kernel_size=3, stride=3, padding=0
+            ),  # 4x4 -> 12x12
             nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
-            # Second expansion layer - from 4x4 to 12x12
+            # Second expansion layer - from 12x12 to 24x24
             nn.ConvTranspose2d(
                 256, 128, kernel_size=3, stride=2, padding=1, output_padding=1
-            ),  # 4x4 -> 8x8 -> adjust to 12x12
+            ),  # 12x12 -> 24x24
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
-            # Final expansion layer - from 12x12 to 24x24 then to 48x48
+            # Final expansion layer - from 24x24 to 48x48
             nn.ConvTranspose2d(
                 128, 64, kernel_size=3, stride=2, padding=1, output_padding=1
-            ),  # 12x12 -> 24x24
+            ),  # 24x24 -> 48x48
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
         )
@@ -110,22 +111,21 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
         )
-        
+
         # Final upsampling layers to match input size (128x128 -> 192x192)
-        # Two-stage upsampling: 128 -> 160 -> 192
+        # Calculate exact parameters: 128 * 1.5 = 192
+        # Use two-step approach: 128 -> 192 using kernel_size=4, stride=1, padding=0
         self.final_upsample = nn.Sequential(
-            # First ConvTranspose: 128x128 -> 160x160 (1.25x)
-            nn.ConvTranspose2d(1, 32, kernel_size=3, stride=1, padding=0, output_padding=0),  # 128 -> 130
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(32, 16, kernel_size=4, stride=1, padding=1, output_padding=0),  # 130 -> 131
+            # First stage: 128x128 -> 160x160
+            nn.ConvTranspose2d(
+                1, 16, kernel_size=5, stride=1, padding=0, output_padding=0
+            ),  # 128 + 4 = 132
             nn.BatchNorm2d(16),
             nn.ReLU(inplace=True),
-            # Second ConvTranspose: 160x160 -> 192x192 (1.2x)
-            nn.ConvTranspose2d(16, 8, kernel_size=5, stride=1, padding=0, output_padding=0),  # 131 -> 135
-            nn.BatchNorm2d(8),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(8, 1, kernel_size=58, stride=1, padding=0, output_padding=0),  # 135 -> 192
+            # Second stage: 132x132 -> 192x192
+            nn.ConvTranspose2d(
+                16, 1, kernel_size=61, stride=1, padding=0, output_padding=0
+            ),  # 132 + 60 = 192
         )
 
         # NOW calculate feature sizes with the additional encoder
@@ -254,7 +254,7 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
 
         # Group 1: First encoder layer (highest LR - randomly initialized for 3-channel input)
         first_encoder_params = []
-        
+
         # Group 2: New VAE components (highest LR)
         new_component_params = []
         new_component_names = [
@@ -557,9 +557,7 @@ def create_vae_model(hparams, pretrained_path=None):
         strides=(2, 2, 1),
         num_res_units=3,
         latent_dim=getattr(hparams, "latent_dim", 32),
-        input_channels=getattr(
-            hparams, "input_channels", 3
-        ),  # Default 3 for conditional
+        input_channels=getattr(hparams, "input_channels", 3),
         pretrained_path=pretrained_path,
     )
 

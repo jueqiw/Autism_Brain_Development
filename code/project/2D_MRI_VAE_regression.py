@@ -326,15 +326,10 @@ def train_fold_two_stage(
         log_dir = os.path.join(log_dir, f"{hparams.experiment_name}_two_stage")
     writer = SummaryWriter(log_dir=log_dir)
 
-    # Get stage transition epoch from hyperparameters
     stage_transition_epoch = getattr(hparams, "stage_transition_epoch", 40)
-    warmup_epochs = min(
-        stage_transition_epoch, epochs
-    )  # Warm-up until transition epoch or total epochs
+    warmup_epochs = min(stage_transition_epoch, epochs)
     finetune_epochs = epochs - warmup_epochs
-    stage_epochs = (
-        max(1, finetune_epochs // 3) if finetune_epochs > 0 else 1
-    )  # Divide fine-tuning into 3 stages
+    stage_epochs = max(1, finetune_epochs // 3) if finetune_epochs > 0 else 1
 
     print(
         f"Two-stage training: {warmup_epochs} warm-up + {finetune_epochs} fine-tuning epochs"
@@ -449,8 +444,17 @@ def train_epoch(
 
         # Compute VAE loss using local vae_loss_fn with configurable weights
         recon_weight = getattr(hparams, "recon_weight", 1.0)
-        kl_weight = getattr(hparams, "kl_weight", 0.01)
+        base_kl_weight = getattr(hparams, "kl_weight", 0.01)
         age_weight = getattr(hparams, "age_weight", 10.0)
+
+        # KL annealing: gradually increase KL weight to prevent rapid increase
+        max_kl_weight = 0.05  # Target KL weight (5x higher than current)
+        annealing_epochs = getattr(hparams, "kl_annealing_epochs", 100)
+        kl_weight = min(
+            max_kl_weight,
+            base_kl_weight
+            + (max_kl_weight - base_kl_weight) * (epoch / annealing_epochs),
+        )
 
         total_loss, recon_loss, kl_loss, age_loss = vae_loss_fn(
             imgs,
@@ -779,7 +783,6 @@ def main(hparams):
     # Load cached dataset directly
     cached_dataset = create_monai_dataset(cache_rate=1, num_workers=8)
     print(f"Loaded cached dataset with {len(cached_dataset)} samples")
-
     print("Splitting dataset by subjects into train/val/test (8:1:1)...")
 
     # Get all unique subjects and their sample indices
