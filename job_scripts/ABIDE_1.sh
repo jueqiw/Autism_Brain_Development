@@ -16,14 +16,14 @@ cd /project/ace-genetics/jueqiw/code/Autism_Brain_Development/code/project/
 
 python 2D_MRI_VAE_regression.py \
     --recon_weight 10.0 \
-    --kl_weight 0.005 \
+    --kl_weight 0.01 \
     --age_weight 1.0 \
     --latent_dim 64 \
     --learning_rate 0.0005 \
     --batch_size 32 \
     --n_epochs 200 \
     --stage_transition_epoch 50 \
-    --experiment_name "vae_better_reconstruction_v1_with_conditional"
+    --experiment_name "vae_new_with_tanh_in_encoder"
 
 # python3 /project/ace-genetics/jueqiw/code/Autism_Brain_Development/code/project/weighted_l1_all_monai_autoencoder.py \
 #     --loss_type simple_l1 \

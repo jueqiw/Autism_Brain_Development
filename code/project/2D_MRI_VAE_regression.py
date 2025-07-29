@@ -35,7 +35,7 @@ from utils.const import (
     ABIDE_PATH,
     PRE_TRAINED_WEIGHTS,
 )
-from models.vae import create_vae_model
+from models.vae import create_vae_model, save_vae_model, load_vae_model
 
 torch.set_num_threads(8)  # or the number you request
 os.environ["OMP_NUM_THREADS"] = "8"
@@ -99,8 +99,8 @@ class MRIAgeDataset(Dataset):
 
         img = sample["image"]  # Already preprocessed tensor (1, H, W)
 
-        # Normalize age to [0, 1] range (assuming ages are 0-21)
-        age_normalized = sample["age"] / 21.0
+        # Normalize age to [-1, 1] range to match tanh output (assuming ages are 0-21)
+        age_normalized = (sample["age"] / 21.0) * 2.0 - 1.0  # [0,1] -> [-1,1]
         age = torch.tensor([age_normalized], dtype=torch.float32)
 
         if self.use_conditional:
@@ -351,7 +351,14 @@ def train_fold_two_stage(
     optimizer = torch.optim.Adam(param_groups)
 
     for epoch in range(warmup_epochs):
-        train_loss, val_loss, avg_recon_loss, avg_kl_loss, avg_age_loss = train_epoch(
+        (
+            train_loss,
+            val_loss,
+            avg_recon_loss,
+            avg_kl_loss,
+            avg_age_loss,
+            avg_perceptual_loss,
+        ) = train_epoch(
             train_loader, val_loader, model, optimizer, writer, epoch, "warmup", hparams
         )
         total_train_history.append(train_loss)
@@ -423,6 +430,7 @@ def train_epoch(
     total_recon_loss = 0
     total_kl_loss = 0
     total_age_loss = 0
+    total_perceptual_loss = 0
 
     train_sample_for_logging = None
 
@@ -456,7 +464,10 @@ def train_epoch(
             + (max_kl_weight - base_kl_weight) * (epoch / annealing_epochs),
         )
 
-        total_loss, recon_loss, kl_loss, age_loss = vae_loss_fn(
+        # Use perceptual loss for sharper images
+        perceptual_weight = getattr(hparams, "perceptual_weight", 0.01)
+
+        loss_result = vae_loss_fn(
             imgs,
             recon,
             z_mean,
@@ -469,7 +480,15 @@ def train_epoch(
             recon_weight=recon_weight,
             kl_weight=kl_weight,
             age_weight=age_weight,
+            perceptual_weight=perceptual_weight,
         )
+
+        # Handle different return formats (backward compatibility)
+        if len(loss_result) == 5:
+            total_loss, recon_loss, kl_loss, age_loss, perceptual_loss = loss_result
+        else:
+            total_loss, recon_loss, kl_loss, age_loss = loss_result
+            perceptual_loss = 0.0
 
         total_loss.backward()
         optimizer.step()
@@ -478,6 +497,11 @@ def train_epoch(
         total_recon_loss += recon_loss.item()
         total_kl_loss += kl_loss.item()
         total_age_loss += age_loss.item()
+        total_perceptual_loss += (
+            perceptual_loss
+            if isinstance(perceptual_loss, (int, float))
+            else perceptual_loss.item()
+        )
 
         # Store sample for logging
         if batch_idx == 0 and (epoch + 1) % 10 == 0:
@@ -491,6 +515,7 @@ def train_epoch(
     avg_train_recon = total_recon_loss / len(train_loader)
     avg_train_kl = total_kl_loss / len(train_loader)
     avg_train_age = total_age_loss / len(train_loader)
+    avg_train_perceptual = total_perceptual_loss / len(train_loader)
 
     # Validation phase
     model.eval()
@@ -498,6 +523,7 @@ def train_epoch(
     total_val_recon = 0
     total_val_kl = 0
     total_val_age = 0
+    total_val_perceptual = 0
     sample_inputs = sample_reconstructions = sample_ages = None
 
     with torch.no_grad():
@@ -516,7 +542,7 @@ def train_epoch(
                 age_pred_val,
             ) = model(imgs_val, ages_val)
 
-            val_loss, val_recon, val_kl, val_age = vae_loss_fn(
+            val_loss_result = vae_loss_fn(
                 imgs_val,
                 recon_val,
                 z_mean_val,
@@ -526,11 +552,25 @@ def train_epoch(
                 age_mean_val,
                 age_logvar_val,
                 ages_val,
+                perceptual_weight=perceptual_weight,
             )
+
+            # Handle different return formats (backward compatibility)
+            if len(val_loss_result) == 5:
+                val_loss, val_recon, val_kl, val_age, val_perceptual = val_loss_result
+            else:
+                val_loss, val_recon, val_kl, val_age = val_loss_result
+                val_perceptual = 0.0
+
             total_val_loss += val_loss.item()
             total_val_recon += val_recon.item()
             total_val_kl += val_kl.item()
             total_val_age += val_age.item()
+            total_val_perceptual += (
+                val_perceptual
+                if isinstance(val_perceptual, (int, float))
+                else val_perceptual.item()
+            )
 
             # Store samples for logging
             if batch_idx == 0 and (epoch + 1) % 10 == 0:
@@ -542,6 +582,7 @@ def train_epoch(
     avg_val_recon = total_val_recon / len(val_loader)
     avg_val_kl = total_val_kl / len(val_loader)
     avg_val_age = total_val_age / len(val_loader)
+    avg_val_perceptual = total_val_perceptual / len(val_loader)
 
     # Log metrics to TensorBoard - separate training and validation plots
     # Training losses
@@ -549,12 +590,14 @@ def train_epoch(
     writer.add_scalar("train_loss/reconstruction", avg_train_recon, epoch)
     writer.add_scalar("train_loss/kl_divergence", avg_train_kl, epoch)
     writer.add_scalar("train_loss/age_regression", avg_train_age, epoch)
+    writer.add_scalar("train_loss/perceptual", avg_train_perceptual, epoch)
 
     # Validation losses
     writer.add_scalar("val_loss/total", avg_val_loss, epoch)
     writer.add_scalar("val_loss/reconstruction", avg_val_recon, epoch)
     writer.add_scalar("val_loss/kl_divergence", avg_val_kl, epoch)
     writer.add_scalar("val_loss/age_regression", avg_val_age, epoch)
+    writer.add_scalar("val_loss/perceptual", avg_val_perceptual, epoch)
 
     # Log images every 10 epochs - simplified titles with just epoch
     if (epoch + 1) % 10 == 0:
@@ -581,171 +624,14 @@ def train_epoch(
                 prefix="Validation",
             )
 
-    return avg_train_loss, avg_val_loss, avg_train_recon, avg_train_kl, avg_train_age
-
-
-# Original training function (kept for compatibility)
-def train_fold(train_loader, val_loader, model, epochs, lr=1e-3, hparams=None):
-    model.train()
-    # Only optimize parameters that require gradients (trainable parameters)
-    optimizer = torch.optim.Adam(
-        filter(lambda p: p.requires_grad, model.parameters()), lr=lr
+    return (
+        avg_train_loss,
+        avg_val_loss,
+        avg_train_recon,
+        avg_train_kl,
+        avg_train_age,
+        avg_train_perceptual,
     )
-
-    log_dir = "/projectnb/ace-genetics/jueqiw/experiment/Autism_Brain_Development/experiments/tensorboard"
-    if hparams and hasattr(hparams, "experiment_name"):
-        log_dir = os.path.join(log_dir, f"{hparams.experiment_name}_fold")
-    writer = SummaryWriter(log_dir=log_dir)
-
-    train_loss_history = []
-    val_loss_history = []
-
-    for epoch in range(epochs):
-        total_train_loss = 0
-        total_recon_loss = 0
-        total_kl_loss = 0
-        total_age_loss = 0
-
-        train_sample_for_logging = None
-        for batch_idx, (imgs, ages) in enumerate(train_loader):
-            imgs = imgs.to(device)
-            ages = ages.to(device)
-
-            optimizer.zero_grad()
-            (
-                recon,
-                z_mean,
-                z_logvar,
-                pz_mean,
-                pz_logvar,
-                age_mean,
-                age_logvar,
-                age_pred,
-            ) = model(imgs, ages)
-
-            total_loss, recon_loss, kl_loss, age_loss = vae_loss_fn(
-                imgs,
-                recon,
-                z_mean,
-                z_logvar,
-                pz_mean,
-                pz_logvar,
-                age_mean,
-                age_logvar,
-                ages,
-            )
-
-            total_loss.backward()
-            optimizer.step()
-
-            total_train_loss += total_loss.item()
-            total_recon_loss += recon_loss.item()
-            total_kl_loss += kl_loss.item()
-            total_age_loss += age_loss.item()
-
-            # Store sample for logging
-            if batch_idx == 0 and (epoch + 1) % 10 == 0:
-                train_sample_for_logging = (
-                    imgs[:4].detach().cpu(),
-                    recon[:4].detach().cpu(),
-                    ages[:4].detach().cpu(),
-                )
-
-        avg_train_loss = total_train_loss / len(train_loader)
-        avg_recon_loss = total_recon_loss / len(train_loader)
-        avg_kl_loss = total_kl_loss / len(train_loader)
-        avg_age_loss = total_age_loss / len(train_loader)
-
-        train_loss_history.append(avg_train_loss)
-
-        # Log training losses
-        writer.add_scalar("Loss/Train_Total", avg_train_loss, epoch)
-        writer.add_scalar("Loss/Train_Reconstruction", avg_recon_loss, epoch)
-        writer.add_scalar("Loss/Train_KL", avg_kl_loss, epoch)
-        writer.add_scalar("Loss/Train_Age", avg_age_loss, epoch)
-
-        # Validation
-        model.eval()
-        total_val_loss = 0
-        sample_inputs = sample_reconstructions = sample_ages = None
-
-        with torch.no_grad():
-            for batch_idx, (imgs_val, ages_val) in enumerate(val_loader):
-                imgs_val = imgs_val.to(device)
-                ages_val = ages_val.to(device)
-
-                (
-                    recon_val,
-                    z_mean_val,
-                    z_logvar_val,
-                    pz_mean_val,
-                    pz_logvar_val,
-                    age_mean_val,
-                    age_logvar_val,
-                    age_pred_val,
-                ) = model(imgs_val, ages_val)
-
-                val_loss, _, _, _ = vae_loss_fn(
-                    imgs_val,
-                    recon_val,
-                    z_mean_val,
-                    z_logvar_val,
-                    pz_mean_val,
-                    pz_logvar_val,
-                    age_mean_val,
-                    age_logvar_val,
-                    ages_val,
-                )
-
-                total_val_loss += val_loss.item()
-
-                # Store samples for logging
-                if batch_idx == 0 and (epoch + 1) % 10 == 0:
-                    sample_inputs = imgs_val[:4].detach().cpu()
-                    sample_reconstructions = recon_val[:4].detach().cpu()
-                    sample_ages = ages_val[:4].detach().cpu()
-
-        avg_val_loss = total_val_loss / len(val_loader)
-        val_loss_history.append(avg_val_loss)
-
-        writer.add_scalar("Loss/Validation", avg_val_loss, epoch)
-
-        # Log images every 10 epochs
-        if (epoch + 1) % 10 == 0:
-            if train_sample_for_logging is not None:
-                sample_train_inputs, sample_train_recons, sample_train_ages = (
-                    train_sample_for_logging
-                )
-                log_vae_images(
-                    writer,
-                    sample_train_inputs,
-                    sample_train_recons,
-                    sample_train_ages,
-                    epoch,
-                    prefix="Train",
-                )
-
-            if sample_inputs is not None:
-                log_vae_images(
-                    writer,
-                    sample_inputs,
-                    sample_reconstructions,
-                    sample_ages,
-                    epoch,
-                    prefix="Val",
-                )
-
-            print(
-                f"Epoch {epoch+1}/{epochs} - Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f}"
-            )
-            print(
-                f"  Recon: {avg_recon_loss:.6f} | KL: {avg_kl_loss:.6f} | Age: {avg_age_loss:.6f}"
-            )
-
-        model.train()  # Switch back to training mode
-
-    writer.close()
-    return model
 
 
 # Evaluation function
@@ -758,15 +644,25 @@ def evaluate(val_loader, model):
             imgs = imgs.to(device)
             ages = ages.to(device)
             # Get age prediction from VAE
-            _, _, _, age_mean, _, _ = model(imgs, ages)
-            preds.append(age_mean.cpu().numpy())
+            (
+                recon_val,
+                z_mean_val,
+                z_logvar_val,
+                pz_mean_val,
+                pz_logvar_val,
+                age_mean_val,
+                age_logvar_val,
+                age_pred_val,
+            ) = model(imgs, ages)
+            preds.append(age_pred_val.cpu().numpy())
             targets.append(ages.cpu().numpy())
     preds = np.concatenate(preds).squeeze()
     targets = np.concatenate(targets).squeeze()
 
     # Denormalize predictions and targets back to original age scale
-    preds_denorm = preds * 21.0
-    targets_denorm = targets * 21.0
+    # Convert from [-1,1] back to [0,21]
+    preds_denorm = (preds + 1.0) / 2.0 * 21.0
+    targets_denorm = (targets + 1.0) / 2.0 * 21.0
 
     mse = mean_squared_error(targets_denorm, preds_denorm)
     r2 = r2_score(targets_denorm, preds_denorm)
@@ -793,7 +689,6 @@ def main(hparams):
             subject_to_indices[subject_id] = []
         subject_to_indices[subject_id].append(idx)
 
-    # Split subjects into train/val/test
     unique_subjects = list(subject_to_indices.keys())
     np.random.seed(42)
     np.random.shuffle(unique_subjects)
@@ -850,32 +745,40 @@ def main(hparams):
     test_preds, test_targets, test_mse, test_r2 = evaluate(test_loader, trained_model)
     print(f"Test MSE: {test_mse:.4f}, R2: {test_r2:.4f}")
 
-    os.makedirs("torch_weights/vae_weights", exist_ok=True)
-    torch.save(trained_model.state_dict(), "torch_weights/vae_weights/vae_final.pt")
-    print("Model saved to torch_weights/vae_weights/vae_final.pt")
-
-    trained_model.eval()
-    age_points = (
-        torch.tensor([8.0, 10.0, 12.0, 14.0, 16.0, 18.0, 20.0], dtype=torch.float32)
-        .unsqueeze(1)
-        .to(device)
+    result_folder = Path(
+        "/projectnb/ace-genetics/jueqiw/experiment/Autism_Brain_Development/experiments/vae_weight"
+    )
+    # Save the trained VAE model using the custom save function
+    os.makedirs(str(result_folder), exist_ok=True)
+    save_vae_model(
+        trained_model,
+        str(result_folder / f"vae_{hparams.experiment_name}.pt"),
+        hparams=hparams,
+        epoch=hparams.n_epochs,
     )
 
-    os.makedirs("torch_generations_vae/axial_generations", exist_ok=True)
+    # trained_model.eval()
+    # age_points = (
+    #     torch.tensor([8.0, 10.0, 12.0, 14.0, 16.0, 18.0, 20.0], dtype=torch.float32)
+    #     .unsqueeze(1)
+    #     .to(device)
+    # )
 
-    with torch.no_grad():
-        # Generate age-dependent priors and sample from them
-        pz_mean, pz_logvar = trained_model.age_to_prior(age_points)
+    # os.makedirs("torch_generations_vae/axial_generations", exist_ok=True)
 
-        # Sample from the age-conditioned latent space
-        z_samples = (
-            trained_model.reparameterize(pz_mean, pz_logvar)
-            if hasattr(trained_model, "reparameterize")
-            else pz_mean
-        )
+    # with torch.no_grad():
+    #     # Generate age-dependent priors and sample from them
+    #     pz_mean, pz_logvar = trained_model.age_to_prior(age_points)
 
-        # Decode to images
-        generated_images = trained_model.decode(z_samples)
+    #     # Sample from the age-conditioned latent space
+    #     z_samples = (
+    #         trained_model.reparameterize(pz_mean, pz_logvar)
+    #         if hasattr(trained_model, "reparameterize")
+    #         else pz_mean
+    #     )
+
+    #     # Decode to images
+    #     generated_images = trained_model.decode(z_samples)
 
     # for i, age in enumerate(age_points.squeeze().cpu().numpy()):
     #     img = generated_images[i]
@@ -883,11 +786,46 @@ def main(hparams):
     #         img, f"torch_generations_vae/axial_generations/generated_age_{age:.1f}.png"
     #     )
 
-    print("Generated images saved to torch_generations_vae/axial_generations/")
+    # print("Generated images saved to torch_generations_vae/axial_generations/")
+
+    # Test the model loading functionality
+    test_model_loading(
+        str(result_folder / f"vae_{hparams.experiment_name}.pt"), test_loader
+    )
+
+
+def test_model_loading(model_path, test_loader):
+    """Test the model loading functionality"""
+    print(f"\n=== Testing Model Loading from {model_path} ===")
+
+    try:
+        # Load the saved model
+        loaded_model, checkpoint_info = load_vae_model(model_path, device=device)
+    except Exception as e:
+        print(f"Error loading model: {e}")
+        print(
+            "This might be an old-style model save. Please re-save using save_vae_model()."
+        )
+        return None
+
+    # Set to evaluation mode
+    loaded_model.eval()
+
+    # Test on a small batch
+    with torch.no_grad():
+        for imgs, ages in test_loader:
+            imgs = imgs.to(device)
+            ages = ages.to(device)
+
+            # Forward pass with loaded model
+            output = loaded_model(imgs, ages)
+            reconstruction = output[0]
+
+    print("=== Model Loading Test Complete ===\n")
+    return loaded_model
 
 
 if __name__ == "__main__":
     parser = ArgumentParser(description="Trainer args", add_help=False)
     add_argument(parser)
     main(parser.parse_args())
-    main()

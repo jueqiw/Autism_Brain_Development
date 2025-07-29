@@ -1,9 +1,10 @@
 import sys
-
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from monai.networks.nets import AutoEncoder
+import torchvision.models as models
 
 
 def reparameterize(mu, logvar):
@@ -11,6 +12,77 @@ def reparameterize(mu, logvar):
     std = torch.exp(0.5 * logvar)
     eps = torch.randn_like(std)
     return mu + eps * std
+
+
+class VGGPerceptualLoss(nn.Module):
+    """Perceptual loss using pretrained VGG features"""
+    
+    def __init__(self, feature_layers=None, use_normalization=True):
+        super().__init__()
+        if feature_layers is None:
+            # Use multiple layers for richer perceptual comparison
+            feature_layers = ['relu1_2', 'relu2_2', 'relu3_3', 'relu4_3']
+        
+        self.feature_layers = feature_layers
+        self.use_normalization = use_normalization
+        
+        # Load pretrained VGG16
+        vgg = models.vgg16(pretrained=True).features
+        self.vgg = vgg
+        
+        # Freeze VGG parameters
+        for param in self.vgg.parameters():
+            param.requires_grad = False
+        
+        self.vgg.eval()
+        
+        # Layer name mapping for VGG16
+        self.layer_name_mapping = {
+            'relu1_2': 3,   # After ReLU of conv1_2
+            'relu2_2': 8,   # After ReLU of conv2_2  
+            'relu3_3': 15,  # After ReLU of conv3_3
+            'relu4_3': 22,  # After ReLU of conv4_3
+        }
+        
+    def normalize_batch(self, batch):
+        """Normalize batch for VGG (ImageNet pretrained)"""
+        if self.use_normalization:
+            # ImageNet normalization
+            mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(batch.device)
+            std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(batch.device)
+            return (batch - mean) / std
+        return batch
+    
+    def get_features(self, x):
+        """Extract features from specified layers"""
+        # Convert single channel to 3 channels for VGG
+        if x.shape[1] == 1:
+            x = x.repeat(1, 3, 1, 1)
+        
+        # Normalize for VGG
+        x = self.normalize_batch(x)
+        
+        features = {}
+        for name, layer_idx in self.layer_name_mapping.items():
+            if name in self.feature_layers:
+                for i in range(layer_idx + 1):
+                    x = self.vgg[i](x)
+                features[name] = x.clone()
+        
+        return features
+    
+    def forward(self, pred, target):
+        """Compute perceptual loss between predicted and target images"""
+        pred_features = self.get_features(pred)
+        target_features = self.get_features(target)
+        
+        perceptual_loss = 0
+        for layer in self.feature_layers:
+            # L2 loss between features
+            loss = F.mse_loss(pred_features[layer], target_features[layer])
+            perceptual_loss += loss
+            
+        return perceptual_loss / len(self.feature_layers)
 
 
 class VAEWithPretrainedAutoEncoder(nn.Module):
@@ -78,9 +150,9 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        # Corresponding decoder layer to upsample back
-        self.additional_decoder = nn.Sequential(
-            # First expansion layer - reverse of the compression
+        # Combined decoder layer to upsample back to pretrained decoder input size (48x48)
+        self.combined_decoder = nn.Sequential(
+            # First expansion layer - reverse of the compression (4x4 -> 12x12)
             nn.ConvTranspose2d(
                 128, 256, kernel_size=3, stride=3, padding=0
             ),  # 4x4 -> 12x12
@@ -92,46 +164,23 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
             ),  # 12x12 -> 24x24
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
-            # Final expansion layer - from 24x24 to 48x48
+            # Third expansion layer - from 24x24 to 48x48 (final size for decoder input)
             nn.ConvTranspose2d(
                 128, 64, kernel_size=3, stride=2, padding=1, output_padding=1
             ),  # 24x24 -> 48x48
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
-        )
-
-        # Final trainable layer to match pretrained decoder input size
-        self.interpolate_to_decoder = nn.Sequential(
-            nn.ConvTranspose2d(
-                64, 64, kernel_size=4, stride=2, padding=1
-            ),  # Should get close to 48x48
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),  # Refine features
+            # Refinement layer to clean up features
+            nn.Conv2d(64, 64, kernel_size=3, stride=1, padding=1),  # Keep 48x48
             nn.BatchNorm2d(64),
             nn.ReLU(inplace=True),
         )
-
-        # Final upsampling layers to match input size (128x128 -> 192x192)
-        # Calculate exact parameters: 128 * 1.5 = 192
-        # Use two-step approach: 128 -> 192 using kernel_size=4, stride=1, padding=0
-        self.final_upsample = nn.Sequential(
-            # First stage: 128x128 -> 160x160
-            nn.ConvTranspose2d(
-                1, 16, kernel_size=5, stride=1, padding=0, output_padding=0
-            ),  # 128 + 4 = 132
-            nn.BatchNorm2d(16),
-            nn.ReLU(inplace=True),
-            # Second stage: 132x132 -> 192x192
-            nn.ConvTranspose2d(
-                16, 1, kernel_size=61, stride=1, padding=0, output_padding=0
-            ),  # 132 + 60 = 192
-        )
+        self.tanh = nn.Tanh()
 
         # NOW calculate feature sizes with the additional encoder
         self._determine_feature_sizes()
-
         print(f"Creating linear layers with bottleneck_size: {self.bottleneck_size}")
+        # Create linear layers (apply tanh activation in forward pass)
         self.fc_z_mean = nn.Linear(self.bottleneck_size, latent_dim)
         self.fc_z_logvar = nn.Linear(self.bottleneck_size, latent_dim)
 
@@ -142,6 +191,12 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
 
         # Age-dependent prior generator
         self.age_to_prior = AgePriorGenerator(latent_dim)
+        
+        # Perceptual loss network (frozen VGG features)
+        self.perceptual_loss_fn = VGGPerceptualLoss(
+            feature_layers=['relu2_2', 'relu3_3'],  # Use fewer layers for efficiency
+            use_normalization=True
+        )
 
     def _load_compatible_pretrained_weights(self, pretrained_path):
         """Load pretrained weights for compatible layers (skip first conv layer)"""
@@ -221,6 +276,20 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
                 for param in layer.parameters():
                     param.requires_grad = trainable
 
+    def set_final_residual_block_trainable(self, trainable=True):
+        """Set the final residual block (decode_2.resunit) as trainable with high learning rate"""
+        if hasattr(self.decoder_backbone, "decode_2"):
+            decode_2 = getattr(self.decoder_backbone, "decode_2")
+            if hasattr(decode_2, "resunit"):
+                resunit = getattr(decode_2, "resunit")
+                for param in resunit.parameters():
+                    param.requires_grad = trainable
+                print(
+                    f"Set final residual block (decode_2.resunit) trainable: {trainable}"
+                )
+            else:
+                print("Warning: decode_2.resunit not found")
+
     def freeze_pretrained_encoder(self):
         """Freeze all pretrained encoder layers except the first conv"""
         for param in self.encoder_backbone.parameters():
@@ -229,11 +298,11 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
         self.set_encoder_layer_trainable(0, trainable=True)
 
     def freeze_pretrained_decoder(self):
-        """Freeze all pretrained decoder layers except the final layer"""
+        """Freeze all pretrained decoder layers except the final residual block"""
         for param in self.decoder_backbone.parameters():
             param.requires_grad = False
-        # Keep final decoder layer trainable for better reconstruction
-        self.set_decoder_layer_trainable(-1, trainable=True)  # Final decoder layer
+        # Keep final residual block trainable for better reconstruction
+        self.set_final_residual_block_trainable(trainable=True)
 
     def unfreeze_encoder_layer_by_layer(self, stage):
         """Gradually unfreeze encoder layers from deeper to shallower"""
@@ -264,14 +333,12 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
             "fc_age_logvar",
             "fc_latent_to_bottleneck",
             "additional_encoder",
-            "additional_decoder",
-            "interpolate_to_decoder",
-            "final_upsample",
+            "combined_decoder",
             "age_to_prior",
         ]
 
-        # Group 3: Final decoder layer (high LR)
-        final_decoder_params = []
+        # Group 3: Final residual block (high LR)
+        final_residual_params = []
 
         # Group 4: Other pretrained components (low LR)
         other_pretrained_params = []
@@ -286,18 +353,12 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
             # Check if it's a new VAE component
             elif any(comp_name in name for comp_name in new_component_names):
                 new_component_params.append(param)
-            # Check if it's the final decoder layer - identify dynamically
+            # Check if it's the final residual block (decode_2.resunit)
+            elif "decoder_backbone.decode_2.resunit" in name:
+                final_residual_params.append(param)
+            # Check if it's any other decoder backbone component
             elif "decoder_backbone" in name:
-                # Get the final decoder layer name dynamically
-                decoder_layers = list(self.decoder_backbone.named_children())
-                if decoder_layers:
-                    final_layer_name = decoder_layers[-1][0]
-                    if final_layer_name in name:
-                        final_decoder_params.append(param)
-                    else:
-                        other_pretrained_params.append(param)
-                else:
-                    other_pretrained_params.append(param)
+                other_pretrained_params.append(param)
             # Everything else that's trainable
             else:
                 other_pretrained_params.append(param)
@@ -330,17 +391,17 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
                 f"New components: {len(new_component_params)} parameters with LR {new_lr}"
             )
 
-        if final_decoder_params:
+        if final_residual_params:
             param_groups.append(
                 {
-                    "params": final_decoder_params,
-                    "lr": new_lr * 0.8,  # Slightly lower than new components
-                    "weight_decay": weight_decay * 0.5,
-                    "name": "final_decoder",
+                    "params": final_residual_params,
+                    "lr": new_lr * 1.0,  # High LR for final residual block
+                    "weight_decay": weight_decay * 0.1,
+                    "name": "final_residual_block",
                 }
             )
             print(
-                f"Final decoder: {len(final_decoder_params)} parameters with LR {new_lr * 0.8}"
+                f"Final residual block: {len(final_residual_params)} parameters with LR {new_lr * 1.0}"
             )
 
         if other_pretrained_params:
@@ -401,13 +462,13 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
         flat_features = compressed_features.view(compressed_features.size(0), -1)
 
         # VAE latent parameters
-        z_mean = self.fc_z_mean(flat_features)
-        z_logvar = self.fc_z_logvar(flat_features)
+        z_mean = self.tanh(self.fc_z_mean(flat_features))  # Apply tanh to z_mean
+        z_logvar = self.fc_z_logvar(flat_features)  # No tanh for logvar
         z = reparameterize(z_mean, z_logvar)
 
         # Age regression parameters
-        age_mean = self.fc_age_mean(flat_features)
-        age_logvar = self.fc_age_logvar(flat_features)
+        age_mean = self.tanh(self.fc_age_mean(flat_features))  # Apply tanh to age_mean
+        age_logvar = self.fc_age_logvar(flat_features)  # No tanh for logvar
         age_pred = reparameterize(age_mean, age_logvar)
 
         return z_mean, z_logvar, z, age_mean, age_logvar, age_pred
@@ -420,26 +481,21 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
         # Reshape to compressed bottleneck shape
         compressed_features = compressed_flat.view(-1, *self.bottleneck_shape)
 
-        # Pass through additional decoder layers to expand back
-        expanded_features = self.additional_decoder(compressed_features)
+        # Pass through combined decoder layers to expand back to decoder input size
+        decoder_input = self.combined_decoder(compressed_features)
 
-        # Interpolate to match pretrained decoder input size (48x48)
-        decoder_input = self.interpolate_to_decoder(expanded_features)
-
-        # Use pretrained decoder (outputs ~128x128)
+        # Use pretrained decoder (outputs 192x192 directly)
+        # The final residual block (decode_2.resunit) will have high learning rate
         reconstruction = self.decoder_backbone(decoder_input)
 
-        # Final upsampling to match input size (128x128 -> 192x192)
-        final_output = self.final_upsample(reconstruction)
-
-        return final_output
+        return reconstruction
 
     def forward(self, x, age=None):
         # Encode
         z_mean, z_logvar, z, age_mean, age_logvar, age_pred = self.encode(x)
 
         # Decode
-        reconstruction = self.decode(z)
+        reconstruction = self.tanh(self.decode(z))
 
         # Generate age-dependent prior if age is provided
         if age is not None:
@@ -501,6 +557,7 @@ def vae_loss_function(
     recon_weight=1.0,
     kl_weight=0.1,
     age_weight=1.0,
+    perceptual_weight=0.1,
 ):
     """Combined VAE loss with brain masking and age regression"""
 
@@ -542,10 +599,23 @@ def vae_loss_function(
     )
     age_loss = age_loss.mean()
 
+    # Perceptual loss using VGG features (create instance if needed)
+    perceptual_loss = 0.0
+    if perceptual_weight > 0:
+        # Create VGG perceptual loss on the fly
+        vgg_loss = VGGPerceptualLoss(
+            feature_layers=['relu2_2', 'relu3_3'], 
+            use_normalization=True
+        ).to(recon.device)
+        perceptual_loss = vgg_loss(recon, target)
+    
     # Combined loss
-    total_loss = recon_weight * recon_loss + kl_weight * kl_loss + age_weight * age_loss
+    total_loss = (recon_weight * recon_loss + 
+                 kl_weight * kl_loss + 
+                 age_weight * age_loss + 
+                 perceptual_weight * perceptual_loss)
 
-    return total_loss, recon_loss, kl_loss, age_loss
+    return total_loss, recon_loss, kl_loss, age_loss, perceptual_loss
 
 
 def create_vae_model(hparams, pretrained_path=None):
@@ -576,3 +646,131 @@ def create_vae_model(hparams, pretrained_path=None):
 
     print("VAE model created with pretrained backbone")
     return model
+
+
+def save_vae_model(
+    model, filepath, hparams=None, epoch=None, optimizer=None, loss_history=None
+):
+    """
+    Save VAE model with all necessary components for reconstruction
+
+    Args:
+        model: VAEWithPretrainedAutoEncoder model
+        filepath: Path to save the model
+        hparams: Hyperparameters used to create the model
+        epoch: Current epoch (optional)
+        optimizer: Optimizer state (optional)
+        loss_history: Training loss history (optional)
+    """
+    save_dict = {
+        "model_state_dict": model.state_dict(),
+        "model_config": {
+            "channels": model.channels,
+            "strides": model.strides,
+            "num_res_units": model.num_res_units,
+            "latent_dim": model.latent_dim,
+            "age_latent_dim": model.age_latent_dim,
+            "input_channels": model.input_channels,
+            "bottleneck_size": model.bottleneck_size,
+            "bottleneck_shape": model.bottleneck_shape,
+        },
+    }
+
+    torch.save(save_dict, filepath)
+    print(f"VAE model saved to {filepath}")
+
+    # Print model summary
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(
+        f"Model summary: {total_params:,} total parameters, {trainable_params:,} trainable"
+    )
+
+
+def load_vae_model(filepath, device="cpu", load_optimizer=False, strict=True):
+    """
+    Load VAE model from saved checkpoint
+
+    Args:
+        filepath: Path to the saved model
+        device: Device to load the model on
+        load_optimizer: Whether to return optimizer state (if available)
+        strict: Whether to strictly enforce state dict loading
+
+    Returns:
+        model: Loaded VAE model
+        checkpoint_info: Dictionary with additional loaded information
+    """
+    checkpoint = torch.load(filepath, map_location=device)
+
+    # Check if this is an old-style save (just state_dict) or new-style save (with model_config)
+    if isinstance(checkpoint, dict) and "model_config" in checkpoint:
+        # New-style save with model_config
+        model_config = checkpoint["model_config"]
+    else:
+        # Old-style save - just state_dict, use default configuration
+        print("Warning: Loading old-style model save. Using default configuration.")
+        model_config = {
+            "channels": (32, 64, 64),
+            "strides": (2, 2, 1),
+            "num_res_units": 3,
+            "latent_dim": 32,
+            "age_latent_dim": 16,
+            "input_channels": 3,
+            "bottleneck_size": 2048,  # Default value
+            "bottleneck_shape": (128, 4, 4),  # Default value
+        }
+        # If checkpoint is just the state_dict, wrap it
+        if not isinstance(checkpoint, dict) or "model_state_dict" not in checkpoint:
+            checkpoint = {"model_state_dict": checkpoint}
+
+    # Recreate the model
+    model = VAEWithPretrainedAutoEncoder(
+        channels=model_config["channels"],
+        strides=model_config["strides"],
+        num_res_units=model_config["num_res_units"],
+        latent_dim=model_config["latent_dim"],
+        age_latent_dim=model_config.get("age_latent_dim", 16),
+        input_channels=model_config["input_channels"],
+        pretrained_path=None,  # Don't reload pretrained weights when loading saved model
+    )
+
+    # Load the saved state
+    missing_keys, unexpected_keys = model.load_state_dict(
+        checkpoint["model_state_dict"], strict=strict
+    )
+
+    if missing_keys:
+        print(f"Warning: Missing keys when loading model: {missing_keys}")
+    if unexpected_keys:
+        print(f"Warning: Unexpected keys when loading model: {unexpected_keys}")
+
+    model.to(device)
+
+    # Prepare checkpoint info
+    checkpoint_info = {
+        "model_config": model_config,
+        "epoch": checkpoint.get("epoch", None),
+        "hparams": checkpoint.get("hparams", None),
+        "loss_history": checkpoint.get("loss_history", None),
+        "save_timestamp": checkpoint.get("save_timestamp", None),
+    }
+
+    # Handle optimizer state if requested
+    if load_optimizer and "optimizer_state_dict" in checkpoint:
+        checkpoint_info["optimizer_state_dict"] = checkpoint["optimizer_state_dict"]
+
+    print(f"VAE model loaded from {filepath}")
+    if checkpoint_info["epoch"] is not None:
+        print(f"Model was saved at epoch {checkpoint_info['epoch']}")
+    if checkpoint_info["save_timestamp"]:
+        print(f"Model was saved on {checkpoint_info['save_timestamp']}")
+
+    # Print model summary
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(
+        f"Loaded model: {total_params:,} total parameters, {trainable_params:,} trainable"
+    )
+
+    return model, checkpoint_info
