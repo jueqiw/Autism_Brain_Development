@@ -25,6 +25,7 @@ from monai.transforms import (
     ToTensord,
 )
 from monai.data import CacheDataset, partition_dataset, NibabelReader
+from monai.losses import PerceptualLoss
 import matplotlib.pyplot as plt
 from tqdm import tqdm
 
@@ -99,8 +100,8 @@ class MRIAgeDataset(Dataset):
 
         img = sample["image"]  # Already preprocessed tensor (1, H, W)
 
-        # Normalize age to [-1, 1] range to match tanh output (assuming ages are 0-21)
-        age_normalized = (sample["age"] / 21.0) * 2.0 - 1.0  # [0,1] -> [-1,1]
+        # Normalize age to [0, 1] range (assuming ages are 0-21)
+        age_normalized = sample["age"] / 21.0  # [0,21] -> [0,1]
         age = torch.tensor([age_normalized], dtype=torch.float32)
 
         if self.use_conditional:
@@ -142,6 +143,7 @@ def vae_loss_fn(
     recon_weight=1.0,
     kl_weight=0.01,
     age_weight=10.0,
+    perceptual_weight=0.0,
 ):
 
     # save the target image
@@ -160,10 +162,29 @@ def vae_loss_fn(
     # Simple age regression loss (MSE) - more stable than probabilistic loss
     age_loss = F.mse_loss(r_mean, r, reduction="mean")
 
-    # Combined weighted loss
-    total_loss = recon_weight * recon_loss + kl_weight * kl_loss + age_weight * age_loss
+    # Perceptual loss (if enabled)
+    perceptual_loss = 0.0
+    if perceptual_weight > 0:
+        # Use MONAI's PerceptualLoss - designed for medical imaging
+        perceptual_loss_fn = PerceptualLoss(
+            spatial_dims=2,
+            network_type="radimagenet_resnet50",
+            is_fake_3d=False,
+            fake_3d_ratio=0.2,
+            pretrained_path="/projectnb/ace-genetics/jueqiw/experiment/Autism_Brain_Development/pretrain_weight/RadImageNet-ResNet50_notop.pth",
+        ).to(x_recon.device)
+        target_img = x[:, 0, :, :].unsqueeze(1)  # Shape: (batch, 1, H, W)
+        perceptual_loss = perceptual_loss_fn(x_recon, target_img)
 
-    return total_loss, recon_loss, kl_loss, age_loss
+    # Combined weighted loss
+    total_loss = (
+        recon_weight * recon_loss
+        + kl_weight * kl_loss
+        + age_weight * age_loss
+        + perceptual_weight * perceptual_loss
+    )
+
+    return total_loss, recon_loss, kl_loss, age_loss, perceptual_loss
 
 
 # Augmentation functions removed - no data augmentation used
@@ -552,6 +573,9 @@ def train_epoch(
                 age_mean_val,
                 age_logvar_val,
                 ages_val,
+                recon_weight=recon_weight,
+                kl_weight=kl_weight,
+                age_weight=age_weight,
                 perceptual_weight=perceptual_weight,
             )
 
@@ -660,9 +684,9 @@ def evaluate(val_loader, model):
     targets = np.concatenate(targets).squeeze()
 
     # Denormalize predictions and targets back to original age scale
-    # Convert from [-1,1] back to [0,21]
-    preds_denorm = (preds + 1.0) / 2.0 * 21.0
-    targets_denorm = (targets + 1.0) / 2.0 * 21.0
+    # Convert from [0,1] back to [0,21]
+    preds_denorm = preds * 21.0
+    targets_denorm = targets * 21.0
 
     mse = mean_squared_error(targets_denorm, preds_denorm)
     r2 = r2_score(targets_denorm, preds_denorm)

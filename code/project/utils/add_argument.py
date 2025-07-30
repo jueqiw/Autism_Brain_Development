@@ -156,11 +156,17 @@ def add_argument(parser: ArgumentParser):
         action="store_true",
         help="Enable mixed precision (FP16) training for memory efficiency and speed",
     )
-    
+
     # Loss function parameters
     parser.add_argument(
         "--loss_type",
-        choices=["focal_l1", "smooth_focal_l1", "balanced_weighted_l1", "adaptive_balanced_l1", "simple_l1"],
+        choices=[
+            "focal_l1",
+            "smooth_focal_l1",
+            "balanced_weighted_l1",
+            "adaptive_balanced_l1",
+            "simple_l1",
+        ],
         default="focal_l1",
         type=str,
         help="Type of loss function to use",
@@ -201,7 +207,7 @@ def add_argument(parser: ArgumentParser):
         type=float,
         help="Threshold for brain mask in balanced weighted L1 loss (areas below this are outside brain)",
     )
-    
+
     # Learning rate scheduler parameters
     parser.add_argument(
         "--scheduler_type",
@@ -228,7 +234,7 @@ def add_argument(parser: ArgumentParser):
         type=int,
         help="Patience for ReduceLROnPlateau scheduler (number of epochs to wait before reducing LR)",
     )
-    
+
     # Model architecture parameters
     parser.add_argument(
         "--model_channels",
@@ -254,7 +260,7 @@ def add_argument(parser: ArgumentParser):
         type=float,
         help="Dropout rate for the model",
     )
-    
+
     # VAE training parameters
     parser.add_argument(
         "--stage_transition_epoch",
@@ -275,7 +281,7 @@ def add_argument(parser: ArgumentParser):
         help="Weight for reconstruction loss in VAE",
     )
     parser.add_argument(
-        "--kl_weight", 
+        "--kl_weight",
         default=0.01,
         type=float,
         help="Weight for KL divergence loss in VAE",
@@ -285,4 +291,10 @@ def add_argument(parser: ArgumentParser):
         default=10.0,
         type=float,
         help="Weight for age regression loss in VAE",
+    )
+    parser.add_argument(
+        "--perceptual_weight",
+        default=0.0,
+        type=float,
+        help="Weight for perceptual loss in VAE (if using perceptual loss)",
     )

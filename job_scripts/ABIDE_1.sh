@@ -23,7 +23,8 @@ python 2D_MRI_VAE_regression.py \
     --batch_size 32 \
     --n_epochs 200 \
     --stage_transition_epoch 50 \
-    --experiment_name "vae_new_with_tanh_in_encoder"
+    --perceptual_weight 0.001 \
+    --experiment_name "vae_new_without_tanh_in_age_perceptual_0.001_InstanceNorm_more_layers_after_decoder_new___"
 
 # python3 /project/ace-genetics/jueqiw/code/Autism_Brain_Development/code/project/weighted_l1_all_monai_autoencoder.py \
 #     --loss_type simple_l1 \
