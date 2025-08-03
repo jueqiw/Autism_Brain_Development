@@ -129,6 +129,24 @@ class MRIAgeDataset(Dataset):
             return img, age
 
 
+# Global perceptual loss instance (created once)
+_perceptual_loss_fn = None
+
+
+def get_perceptual_loss_fn(device):
+    """Get or create perceptual loss function (singleton pattern)"""
+    global _perceptual_loss_fn
+    if _perceptual_loss_fn is None:
+        _perceptual_loss_fn = PerceptualLoss(
+            spatial_dims=2,
+            network_type="radimagenet_resnet50",
+            is_fake_3d=False,
+            fake_3d_ratio=0.2,
+            pretrained_path="/projectnb/ace-genetics/jueqiw/experiment/Autism_Brain_Development/pretrain_weight/RadImageNet-ResNet50_notop.pth",
+        ).to(device)
+    return _perceptual_loss_fn
+
+
 # Loss function combining reconstruction, KL, and label (age) loss
 def vae_loss_fn(
     x,
@@ -165,14 +183,8 @@ def vae_loss_fn(
     # Perceptual loss (if enabled)
     perceptual_loss = 0.0
     if perceptual_weight > 0:
-        # Use MONAI's PerceptualLoss - designed for medical imaging
-        perceptual_loss_fn = PerceptualLoss(
-            spatial_dims=2,
-            network_type="radimagenet_resnet50",
-            is_fake_3d=False,
-            fake_3d_ratio=0.2,
-            pretrained_path="/projectnb/ace-genetics/jueqiw/experiment/Autism_Brain_Development/pretrain_weight/RadImageNet-ResNet50_notop.pth",
-        ).to(x_recon.device)
+        # Use singleton perceptual loss function
+        perceptual_loss_fn = get_perceptual_loss_fn(x_recon.device)
         target_img = x[:, 0, :, :].unsqueeze(1)  # Shape: (batch, 1, H, W)
         perceptual_loss = perceptual_loss_fn(x_recon, target_img)
 
@@ -399,13 +411,10 @@ def train_fold_two_stage(
             break
 
     print("Stage 2: Gradual fine-tuning...")
-
     for stage in range(1, 4):  # 3 fine-tuning stages
         print(f"Fine-tuning stage {stage}/3 - Unfreezing deeper layers...")
-
         # Gradually unfreeze layers
         model.unfreeze_encoder_layer_by_layer(stage)
-
         param_groups = model.get_parameter_groups(
             new_lr=lr * 0.5,  # Lower LR for new layers in fine-tuning
             pretrained_lr=lr * 0.1,  # Much lower LR for pretrained layers
@@ -418,7 +427,14 @@ def train_fold_two_stage(
         stage_end_epoch = min(warmup_epochs + stage * stage_epochs, epochs)
 
         for epoch in range(stage_start_epoch, stage_end_epoch):
-            train_loss, val_loss, _, _, _ = train_epoch(
+            (
+                train_loss,
+                val_loss,
+                avg_recon_loss,
+                avg_kl_loss,
+                avg_age_loss,
+                avg_perceptual_loss,
+            ) = train_epoch(
                 train_loader,
                 val_loader,
                 model,
@@ -476,17 +492,18 @@ def train_epoch(
         base_kl_weight = getattr(hparams, "kl_weight", 0.01)
         age_weight = getattr(hparams, "age_weight", 10.0)
 
-        # KL annealing: gradually increase KL weight to prevent rapid increase
-        max_kl_weight = 0.05  # Target KL weight (5x higher than current)
-        annealing_epochs = getattr(hparams, "kl_annealing_epochs", 100)
+        max_kl_weight = 0.001  # Much lower target KL weight for sharper images
+        annealing_epochs = getattr(
+            hparams, "kl_annealing_epochs", 200
+        )  # Longer annealing
         kl_weight = min(
             max_kl_weight,
-            base_kl_weight
-            + (max_kl_weight - base_kl_weight) * (epoch / annealing_epochs),
+            base_kl_weight * 0.1  # Start with very low KL weight
+            + (max_kl_weight - base_kl_weight * 0.1) * (epoch / annealing_epochs),
         )
 
-        # Use perceptual loss for sharper images
-        perceptual_weight = getattr(hparams, "perceptual_weight", 0.01)
+        # Use perceptual loss for sharper images - increased for sharper reconstructions
+        perceptual_weight = getattr(hparams, "perceptual_weight", 0.1)
 
         loss_result = vae_loss_fn(
             imgs,
@@ -524,13 +541,27 @@ def train_epoch(
             else perceptual_loss.item()
         )
 
-        # Store sample for logging
-        if batch_idx == 0 and (epoch + 1) % 10 == 0:
-            train_sample_for_logging = (
-                imgs[:4].detach().cpu(),
-                recon[:4].detach().cpu(),
-                ages[:4].detach().cpu(),
-            )
+        # Store sample for logging - use different batch each epoch but ensure it exists
+        target_batch_idx = (epoch // 10) % len(train_loader)  # Change every 10 epochs
+        if batch_idx == target_batch_idx and (epoch + 1) % 10 == 0:
+            # Randomly select 4 samples from the batch
+            batch_size = imgs.size(0)
+            if batch_size >= 4:
+                # Use epoch as seed for reproducible randomness
+                torch.manual_seed(epoch + 1000)  # Different seed than validation
+                indices = torch.randperm(batch_size)[:4]
+                train_sample_for_logging = (
+                    imgs[indices].detach().cpu(),
+                    recon[indices].detach().cpu(),
+                    ages[indices].detach().cpu(),
+                )
+            else:
+                # If batch size < 4, use all available samples
+                train_sample_for_logging = (
+                    imgs.detach().cpu(),
+                    recon.detach().cpu(),
+                    ages.detach().cpu(),
+                )
 
     avg_train_loss = total_train_loss / len(train_loader)
     avg_train_recon = total_recon_loss / len(train_loader)
@@ -596,11 +627,23 @@ def train_epoch(
                 else val_perceptual.item()
             )
 
-            # Store samples for logging
-            if batch_idx == 0 and (epoch + 1) % 10 == 0:
-                sample_inputs = imgs_val[:4].detach().cpu()
-                sample_reconstructions = recon_val[:4].detach().cpu()
-                sample_ages = ages_val[:4].detach().cpu()
+            # Store samples for logging - use different batch each epoch but ensure it exists
+            target_batch_idx = (epoch // 10) % len(val_loader)  # Change every 10 epochs
+            if batch_idx == target_batch_idx and (epoch + 1) % 10 == 0:
+                # Randomly select 4 samples from the batch
+                batch_size = imgs_val.size(0)
+                if batch_size >= 4:
+                    # Use epoch as seed for reproducible randomness
+                    torch.manual_seed(epoch)
+                    indices = torch.randperm(batch_size)[:4]
+                    sample_inputs = imgs_val[indices].detach().cpu()
+                    sample_reconstructions = recon_val[indices].detach().cpu()
+                    sample_ages = ages_val[indices].detach().cpu()
+                else:
+                    # If batch size < 4, use all available samples
+                    sample_inputs = imgs_val.detach().cpu()
+                    sample_reconstructions = recon_val.detach().cpu()
+                    sample_ages = ages_val.detach().cpu()
 
     avg_val_loss = total_val_loss / len(val_loader)
     avg_val_recon = total_val_recon / len(val_loader)
@@ -747,7 +790,6 @@ def main(hparams):
     train_dataset = MRIAgeDataset(cached_dataset, train_indices, use_conditional=True)
     val_dataset = MRIAgeDataset(cached_dataset, val_indices, use_conditional=True)
     test_dataset = MRIAgeDataset(cached_dataset, test_indices, use_conditional=True)
-
     train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
     val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
     test_loader = DataLoader(test_dataset, batch_size=64, shuffle=False)

@@ -24,7 +24,7 @@ def add_argument(parser: ArgumentParser):
     parser.add_argument("--contrastive_margin", default=10, type=float)
     parser.add_argument("--classifier_latent_dim", default=64, type=int)
     parser.add_argument("--learning_rate", default=0.000005, type=float)
-    parser.add_argument("--n_epochs", default=3000, type=int)
+    parser.add_argument("--n_epochs", default=300, type=int)
     parser.add_argument(
         "--model",
         default="NeuroPathX",
@@ -156,21 +156,6 @@ def add_argument(parser: ArgumentParser):
         action="store_true",
         help="Enable mixed precision (FP16) training for memory efficiency and speed",
     )
-
-    # Loss function parameters
-    parser.add_argument(
-        "--loss_type",
-        choices=[
-            "focal_l1",
-            "smooth_focal_l1",
-            "balanced_weighted_l1",
-            "adaptive_balanced_l1",
-            "simple_l1",
-        ],
-        default="focal_l1",
-        type=str,
-        help="Type of loss function to use",
-    )
     parser.add_argument(
         "--focal_alpha",
         default=0.25,
@@ -292,9 +277,70 @@ def add_argument(parser: ArgumentParser):
         type=float,
         help="Weight for age regression loss in VAE",
     )
+
+    # GAN-specific arguments
+    parser.add_argument(
+        "--adversarial_weight",
+        default=1.0,
+        type=float,
+        help="Weight for adversarial loss in GAN training",
+    )
+    parser.add_argument(
+        "--content_weight",
+        default=10.0,
+        type=float,
+        help="Weight for content/reconstruction loss in GAN training",
+    )
+    parser.add_argument(
+        "--gradient_penalty_weight",
+        default=10.0,
+        type=float,
+        help="Weight for gradient penalty in WGAN-GP",
+    )
+    parser.add_argument(
+        "--use_wgan_gp",
+        action="store_true",
+        help="Use WGAN-GP instead of standard GAN loss",
+    )
+    parser.add_argument(
+        "--lr_generator",
+        default=2e-4,
+        type=float,
+        help="Learning rate for GAN generator",
+    )
+    parser.add_argument(
+        "--lr_discriminator",
+        default=2e-4,
+        type=float,
+        help="Learning rate for GAN discriminator",
+    )
+    parser.add_argument(
+        "--filters",
+        default=32,  # Reduced from 64 for memory efficiency
+        type=int,
+        help="Number of base filters for GAN models",
+    )
+    parser.add_argument(
+        "--latent_space",
+        default=64,  # Reduced from 128 for memory efficiency
+        type=int,
+        help="Dimension of latent space for GAN generator",
+    )
     parser.add_argument(
         "--perceptual_weight",
-        default=0.0,
+        default=0.1,
         type=float,
-        help="Weight for perceptual loss in VAE (if using perceptual loss)",
+        help="Weight for perceptual loss in GAN training",
+    )
+    parser.add_argument(
+        "--d_train_freq",
+        default=1,
+        type=int,
+        help="Frequency for training discriminator (1=every iteration, 2=every 2nd iteration)",
+    )
+    parser.add_argument(
+        "--g_train_freq",
+        default=1,
+        type=int,
+        help="Frequency for training generator (1=every iteration, 2=every 2nd iteration)",
     )

@@ -20,34 +20,28 @@ class VGGPerceptualLoss(nn.Module):
     def __init__(self, feature_layers=None, use_normalization=True):
         super().__init__()
         if feature_layers is None:
-            # Use multiple layers for richer perceptual comparison
             feature_layers = ["relu1_2", "relu2_2", "relu3_3", "relu4_3"]
 
         self.feature_layers = feature_layers
         self.use_normalization = use_normalization
 
-        # Load pretrained VGG16
         vgg = models.vgg16(weights=models.VGG16_Weights.IMAGENET1K_V1).features
         self.vgg = vgg
 
-        # Freeze VGG parameters
         for param in self.vgg.parameters():
             param.requires_grad = False
 
         self.vgg.eval()
-
-        # Layer name mapping for VGG16
         self.layer_name_mapping = {
-            "relu1_2": 3,  # After ReLU of conv1_2
-            "relu2_2": 8,  # After ReLU of conv2_2
-            "relu3_3": 15,  # After ReLU of conv3_3
-            "relu4_3": 22,  # After ReLU of conv4_3
+            "relu1_2": 3,
+            "relu2_2": 8,
+            "relu3_3": 15,
+            "relu4_3": 22,
         }
 
     def normalize_batch(self, batch):
         """Normalize batch for VGG (ImageNet pretrained)"""
         if self.use_normalization:
-            # ImageNet normalization
             mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1).to(batch.device)
             std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1).to(batch.device)
             return (batch - mean) / std
@@ -55,11 +49,9 @@ class VGGPerceptualLoss(nn.Module):
 
     def get_features(self, x):
         """Extract features from specified layers"""
-        # Convert single channel to 3 channels for VGG
         if x.shape[1] == 1:
             x = x.repeat(1, 3, 1, 1)
 
-        # Normalize for VGG
         x = self.normalize_batch(x)
 
         features = {}
@@ -110,11 +102,11 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
         self.channels = channels
         self.strides = strides
         self.num_res_units = num_res_units
-        # Create autoencoder with 3 input channels from scratch
+        # Create autoencoder with 3 input channels, 32 output channels
         self.base_autoencoder = AutoEncoder(
             spatial_dims=2,
             in_channels=input_channels,  # Use configurable input channels (3)
-            out_channels=1,  # Still output 1 channel (reconstructed brain image)``
+            out_channels=32,  # Output 32 channels for richer feature representation
             channels=channels,
             strides=strides,
             num_res_units=num_res_units,
@@ -179,9 +171,12 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
             nn.ReLU(inplace=True),
         )
 
-        # Post-decoder refinement layers (maintain output shape)
+        # Post-decoder refinement layers (reduce 32 channels to 1 channel)
         self.post_decoder_refinement = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=5, stride=1, padding=2),
+            nn.Conv2d(32, 64, kernel_size=5, stride=1, padding=2),
+            nn.InstanceNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 32, kernel_size=3, stride=1, padding=1),
             nn.InstanceNorm2d(32),
             nn.ReLU(inplace=True),
             nn.Conv2d(32, 16, kernel_size=3, stride=1, padding=1),
@@ -225,11 +220,21 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
                 current_shape = current_state_dict[key].shape
                 pretrained_shape = value.shape
 
-                # Skip first encoder layer due to channel mismatch
+                # Skip first encoder layer due to input channel mismatch
                 if (
                     "encode_0" in key
                     and len(pretrained_shape) >= 2
                     and pretrained_shape[1] != current_shape[1]
+                ):
+                    skipped_layers.append(key)
+                    continue
+
+                # Skip final decoder layer due to output channel mismatch (1 -> 32 channels)
+                if (
+                    "decode_2" in key
+                    and "conv.weight" in key
+                    and len(pretrained_shape) >= 1
+                    and pretrained_shape[0] != current_shape[0]
                 ):
                     skipped_layers.append(key)
                     continue
@@ -460,22 +465,16 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
 
     def encode(self, x):
         """Encode input to VAE latent space and age prediction"""
-        # Get bottleneck features from pretrained encoder
         bottleneck_features = self.encoder_backbone(x)
 
-        # Flatten bottleneck features
-        if isinstance(bottleneck_features, (list, tuple)):
-            bottleneck_features = bottleneck_features[-1]
-
-        # Pass through additional encoder layers to compress further
         compressed_features = self.additional_encoder(bottleneck_features)
 
         # Flatten compressed features
         flat_features = compressed_features.view(compressed_features.size(0), -1)
 
         # VAE latent parameters
-        z_mean = self.tanh(self.fc_z_mean(flat_features))  # Apply tanh to z_mean
-        z_logvar = self.fc_z_logvar(flat_features)  # No tanh for logvar
+        z_mean = self.tanh(self.fc_z_mean(flat_features))
+        z_logvar = self.fc_z_logvar(flat_features)
         z = reparameterize(z_mean, z_logvar)
 
         # Age regression parameters (remove tanh to prevent saturation)
@@ -509,24 +508,19 @@ class VAEWithPretrainedAutoEncoder(nn.Module):
         # Encode
         z_mean, z_logvar, z, age_mean, age_logvar, age_pred = self.encode(x)
 
+        pz_mean, pz_logvar = self.age_to_prior(age)
         # Decode
-        reconstruction = self.softmax(self.decode(z))
-
-        # Generate age-dependent prior if age is provided
-        if age is not None:
-            pz_mean, pz_logvar = self.age_to_prior(age)
-            return (
-                reconstruction,
-                z_mean,
-                z_logvar,
-                pz_mean,
-                pz_logvar,
-                age_mean,
-                age_logvar,
-                age_pred,
-            )
-        else:
-            return reconstruction, z_mean, z_logvar, age_mean, age_logvar, age_pred
+        reconstruction = self.decode(z)
+        return (
+            reconstruction,
+            z_mean,
+            z_logvar,
+            pz_mean,
+            pz_logvar,
+            age_mean,
+            age_logvar,
+            age_pred,
+        )
 
 
 class AgePriorGenerator(nn.Module):
@@ -579,6 +573,7 @@ def create_vae_model(hparams, pretrained_path=None):
             if m.bias is not None:
                 torch.nn.init.zeros_(m.bias)
 
+    # Initialize VAE-specific layers
     model.fc_z_mean.apply(init_new_layers)
     model.fc_z_logvar.apply(init_new_layers)
     model.fc_age_mean.apply(init_new_layers)
@@ -588,6 +583,13 @@ def create_vae_model(hparams, pretrained_path=None):
     model.combined_decoder.apply(init_new_layers)
     model.age_to_prior.apply(init_new_layers)
     model.post_decoder_refinement.apply(init_new_layers)
+
+    # Initialize final decoder layer (decode_2) with random weights since it has 32 output channels
+    if hasattr(model.decoder_backbone, "decode_2"):
+        model.decoder_backbone.decode_2.apply(init_new_layers)
+        print(
+            "Initialized final decoder layer (decode_2) with random weights for 32-channel output"
+        )
 
     print("VAE model created with pretrained backbone")
     return model

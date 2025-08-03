@@ -14,6 +14,13 @@ source /projectnb/ace-genetics/jueqiw/software/venvs/monai/bin/activate
 
 cd /project/ace-genetics/jueqiw/code/Autism_Brain_Development/code/project/
 
+python 2D_MRI_GAN.py \
+    --experiment_name "gan_new_only_increase_age_per_0.3_d_1_deeper_discr" \
+    --n_epoch 500 \
+    --batch_size 32 \
+    --perceptual_weight 0.3 \
+    --d_train_freq 1
+
 python 2D_MRI_VAE_regression.py \
     --recon_weight 10.0 \
     --kl_weight 0.01 \
@@ -24,7 +31,19 @@ python 2D_MRI_VAE_regression.py \
     --n_epochs 200 \
     --stage_transition_epoch 50 \
     --perceptual_weight 0.001 \
-    --experiment_name "vae_new_without_tanh_in_age_perceptual_0.001_InstanceNorm_more_layers_after_decoder_new___"
+    --experiment_name "vae_new"
+
+python 2D_MRI_GAN_ \
+    --recon_weight 10.0 \
+    --kl_weight 0.01 \
+    --age_weight 1.0 \
+    --latent_dim 64 \
+    --learning_rate 0.0005 \
+    --batch_size 32 \
+    --n_epochs 200 \
+    --stage_transition_epoch 50 \
+    --perceptual_weight 0.001 \
+    --experiment_name "vae_new"
 
 # python3 /project/ace-genetics/jueqiw/code/Autism_Brain_Development/code/project/weighted_l1_all_monai_autoencoder.py \
 #     --loss_type simple_l1 \
