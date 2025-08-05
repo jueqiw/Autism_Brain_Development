@@ -2,8 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# Model version to ensure we're using the updated architecture
-MODEL_VERSION = "v4.0_channel_fix_discriminator"
+# Model version for age regression discriminator
+MODEL_VERSION = "v5.0_age_regression_discriminator"
 
 
 class ConvReLU(nn.Module):
@@ -40,23 +40,22 @@ class ConvBNReLU(nn.Module):
         return self.relu(self.bn(self.conv(x)))
 
 
-class Critic2D_with_ASD(nn.Module):
+class Critic2D_with_AgeRegression(nn.Module):
     """
-    Exact PyTorch conversion of critic_2D_with_AD from discriminator.py
-    Line-by-line conversion from Keras to PyTorch
+    Age regression discriminator that predicts age instead of taking it as input
+    Outputs both patch-wise real/fake classification and age regression [0,1]
+    Ages are normalized: age/20.0 to map [0,20] -> [0,1]
     """
 
     def __init__(
         self,
         input_shape=(1, 196, 196),
         filters=32,
-        age_dim=20,
         ASD_dim=1,
     ):
         super().__init__()
         self.input_shape = input_shape
         self.filters = filters
-        self.age_dim = age_dim
         self.ASD_dim = ASD_dim
 
         f = filters
@@ -112,11 +111,11 @@ class Critic2D_with_ASD(nn.Module):
         self.bn1_1 = nn.BatchNorm1d(130)
 
         # Line 61-62: dens2_1 = Dense(units=130, activation="relu") + BatchNormalization
-        self.dens2_1 = nn.Linear(130 + age_dim, 130)
+        self.dens2_1 = nn.Linear(130 + ASD_dim, 130)  # No age_dim, only ASD_dim
         self.bn2_1 = nn.BatchNorm1d(130)
 
         # Line 67: dens3_1 = Dense(units=4160, activation="relu")
-        self.dens3_1 = nn.Linear(130 + ASD_dim, self.flatten_size)
+        self.dens3_1 = nn.Linear(130, self.flatten_size)  # Input from dens2_1
 
         # ========== FINAL LAYERS (updated for deeper architecture) ==========
         # Line 74-77: convF_1 and convF_2 - input is now f*16 + f from concatenation
@@ -132,10 +131,26 @@ class Critic2D_with_ASD(nn.Module):
 
         # Removed global average pooling to maintain spatial dimensions for patch output
 
+        # ========== AGE REGRESSION HEAD ==========
+        # Use convD_1 features (f*32 channels) for age regression
+        self.age_global_pool = nn.AdaptiveAvgPool2d(1)
+        self.age_fc1 = nn.Linear(f * 32, 128)
+        self.age_dropout = nn.Dropout(0.3)
+        self.age_fc2 = nn.Linear(128, 64)
+        self.age_output = nn.Linear(64, 1)  # Single age value [0,1]
+
         # Initialize final layer with smaller weights for stability
         nn.init.normal_(self.convD_2.weight, 0.0, 0.02)
         if self.convD_2.bias is not None:
             nn.init.zeros_(self.convD_2.bias)
+
+        # Initialize age regression layers
+        nn.init.kaiming_normal_(self.age_fc1.weight)
+        nn.init.kaiming_normal_(self.age_fc2.weight)
+        nn.init.normal_(
+            self.age_output.weight, 0.0, 0.01
+        )  # Small weights for regression
+        nn.init.zeros_(self.age_output.bias)
 
     def _calculate_flatten_size(self):
         """Calculate flattened size after 6 pooling operations"""
@@ -148,14 +163,17 @@ class Critic2D_with_ASD(nn.Module):
             spatial_size = x.shape[2] * x.shape[3]
             return self.filters * spatial_size
 
-    def forward(self, d_input, age_vector, ASD_vector):
+    def forward(self, d_input, ASD_vector):
         """
-        Forward pass - exact conversion from original Keras model
+        Forward pass for age regression discriminator
 
         Args:
-            d_input: Input image tensor (line 19: d_input = Input(inp_shape))
-            age_vector: Age vector (line 55: age_vector = Input(shape=(self.conf.age_dim,)))
-            AD_vector: AD vector (line 64: AD_vector = Input(shape=(self.conf.AD_dim,)))
+            d_input: Input image tensor (batch_size, 1, 196, 196)
+            ASD_vector: ASD vector (batch_size, 1) - still used for conditioning
+
+        Returns:
+            patch_output: (batch_size, 1, patch_h, patch_w) - real/fake for each patch
+            age_output: (batch_size, 1) - predicted age normalized to [0,1]
         """
 
         # ========== DISCRIMINATOR PATH ==========
@@ -194,28 +212,20 @@ class Critic2D_with_ASD(nn.Module):
         # Line 51: flat1_1 = Flatten()(mid1_1)
         flat1_1 = mid1_1.view(mid1_1.size(0), -1)  # (batch size, 4160)
 
-        # Line 53-54: dens1_1 = Dense(..., activation="sigmoid") + BatchNormalization
+        # Simplified conditioning without age input
         dens1_1 = torch.sigmoid(self.bn1_1(self.dens1_1(flat1_1)))
 
-        # Line 58: mid_concat1_1 = Concatenate()([dens1_1, age_vector])
-        # Ensure age_vector is on the same device as dens1_1
-        age_vector = age_vector.to(dens1_1.device)
+        # Only concatenate with ASD_vector (no age conditioning)
+        ASD_vector = ASD_vector.to(dens1_1.device)
         mid_concat1_1 = torch.cat(
-            [dens1_1, age_vector], dim=1
-        )  # (batch_size, 130+age_dim)
+            [dens1_1, ASD_vector], dim=1
+        )  # (batch_size, 130+ASD_dim)
 
-        # Line 61-62: dens2_1 = Dense(..., activation="relu") + BatchNormalization
+        # Simplified dense layer
         dens2_1 = F.relu(self.bn2_1(self.dens2_1(mid_concat1_1)))
 
-        # Line 65: mid_concat2_1 = Concatenate()([dens2_1, ASD_vector])
-        # Ensure ASD_vector is on the same device as dens2_1
-        ASD_vector = ASD_vector.to(dens2_1.device)
-        mid_concat2_1 = torch.cat(
-            [dens2_1, ASD_vector], dim=1
-        )  # (batch size, 130+ASD_dim)
-
         # Line 67: dens3_1 = Dense(units=flatten_size, activation="relu")
-        dens3_1 = F.relu(self.dens3_1(mid_concat2_1))  # (batch size, flatten_size)
+        dens3_1 = F.relu(self.dens3_1(dens2_1))  # (batch size, flatten_size)
         # Line 69: rshape1_1 = Reshape - calculate correct spatial dimensions
         batch_size = dens3_1.size(0)
         total_elements = dens3_1.size(1)  # This should match self.flatten_size
@@ -259,45 +269,55 @@ class Critic2D_with_ASD(nn.Module):
 
         # Line 80-83: convD_1 and convD_2
         convD_1 = self.convD_1(convF_2)
-        convD_2 = self.convD_2(convD_1)  # (batch size, 1, height, width) - patch outputs
+        convD_2 = self.convD_2(
+            convD_1
+        )  # (batch size, 1, height, width) - patch outputs
 
-        # Return patch-wise predictions instead of global average
-        # Each spatial location represents a patch prediction
-        # Shape: (batch_size, 1, patch_height, patch_width)
-        return convD_2
+        # ========== AGE REGRESSION COMPUTATION ==========
+        # Use convD_1 features for age regression
+        age_features = self.age_global_pool(convD_1)  # (batch_size, f*32, 1, 1)
+        age_features = age_features.view(age_features.size(0), -1)  # (batch_size, f*32)
+
+        # Age regression network
+        age_hidden1 = F.relu(self.age_fc1(age_features))
+        age_hidden1 = self.age_dropout(age_hidden1)
+        age_hidden2 = F.relu(self.age_fc2(age_hidden1))
+        age_output = torch.sigmoid(self.age_output(age_hidden2))
+
+        # Return both patch predictions and age regression
+        # patch_output: (batch_size, 1, patch_height, patch_width)
+        # age_output: (batch_size, 1) - age normalized to [0,1]
+        return convD_2, age_output
 
 
 def create_discriminator(
     input_shape=(1, 196, 196),  # Single channel input (no conditional channels)
     filters=32,
-    age_dim=20,
     ASD_dim=1,
 ):
     """
-    Factory function to create discriminator - exact match to original build() method
+    Factory function to create age regression discriminator
 
     Args:
         input_shape: Input image shape (channels, height, width)
         filters: Base number of filters (f in original)
-        age_dim: Age vector dimension (self.conf.age_dim in original)
-        AD_dim: AD vector dimension (self.conf.AD_dim in original)
+        ASD_dim: ASD vector dimension (self.conf.ASD_dim in original)
 
     Returns:
-        Critic2D_with_ASD model
+        Critic2D_with_AgeRegression model
     """
-    model = Critic2D_with_ASD(
+    model = Critic2D_with_AgeRegression(
         input_shape=input_shape,
         filters=filters,
-        age_dim=age_dim,
         ASD_dim=ASD_dim,
     )
 
-    print("Created Deeper Discriminator (6-layer architecture):")
+    print("Created Age Regression Discriminator (6-layer architecture):")
     print(f"  Input shape: {input_shape[1:]}")
     print(f"  Filters: {filters}")
-    print(f"  Age dim: {age_dim}")
-    print(f"  AD dim: {ASD_dim}")
-    print(f"  Architecture: 6 conv layers + conditional processing")
+    print(f"  ASD dim: {ASD_dim}")
+    print(f"  Outputs: Patch classification + Age regression [0,1]")
+    print(f"  Architecture: 6 conv layers + age regression head")
 
     return model
 
@@ -309,16 +329,23 @@ if __name__ == "__main__":
 
     batch_size = 2
     d_input = torch.randn(batch_size, 1, 196, 196).to(device)
-    age_vector = torch.randn(batch_size, 20).to(device)
     ASD_vector = torch.randn(batch_size, 1).to(device)
 
     with torch.no_grad():
-        output = discriminator(d_input, age_vector, ASD_vector)
-        print(f"\nPatch Discriminator Test Results:")
+        patch_output, age_output = discriminator(d_input, ASD_vector)
+        print(f"\nAge Regression Discriminator Test Results:")
         print(f"  Input shape: {d_input.shape}")
-        print(f"  Age vector shape: {age_vector.shape}")
         print(f"  ASD vector shape: {ASD_vector.shape}")
-        print(f"  Output shape: {output.shape}")
-        print(f"  Output range: [{output.min():.3f}, {output.max():.3f}]")
-        print(f"  Number of patches: {output.shape[2] * output.shape[3]} ({output.shape[2]}x{output.shape[3]})")
-        print(f"  Patch predictions per sample: {output.view(batch_size, -1).shape[1]}")
+        print(f"  Patch output shape: {patch_output.shape}")
+        print(f"  Age output shape: {age_output.shape}")
+        print(
+            f"  Patch output range: [{patch_output.min():.3f}, {patch_output.max():.3f}]"
+        )
+        print(f"  Age predictions: {age_output.squeeze().cpu().numpy()}")
+        print(f"  Age range: [{age_output.min():.3f}, {age_output.max():.3f}]")
+        print(
+            f"  Number of patches: {patch_output.shape[2] * patch_output.shape[3]} ({patch_output.shape[2]}x{patch_output.shape[3]})"
+        )
+        print(
+            f"  Age predictions (denormalized): {(age_output.squeeze() * 20.0).cpu().numpy()}"
+        )

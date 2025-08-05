@@ -371,7 +371,6 @@ def train_gan(
                     if manipulation_mask[i]:
                         current_age = real_age_vecs[i].sum().item()
                         age_shift = torch.randint(1, 4, (1,)).item()
-                        # if the age is greater than 20, cap it at 20
                         if current_age + age_shift > 20:
                             age_shift = 20 - current_age
                         new_age = max(1, min(20, current_age + age_shift))
@@ -391,29 +390,32 @@ def train_gan(
                 optimizer_d.zero_grad()
                 with torch.cuda.amp.autocast():
 
-                    if batch_idx % 2 == 0:
-                        real_output = discriminator(real_imgs, real_age_vecs, asd_vecs)
-                        fake_imgs = generator(
-                            real_imgs, shifted_age_vecs, asd_vecs
-                        ).detach()
-                        fake_output = discriminator(fake_imgs, new_age_vecs, asd_vecs)
+                    real_output, age_output = discriminator(real_imgs, asd_vecs)
+                    fake_imgs = generator(
+                        real_imgs, shifted_age_vecs, asd_vecs
+                    ).detach()
+                    fake_output, real_fake_age_output = discriminator(
+                        fake_imgs, asd_vecs
+                    )
+                    d_loss_real = adversarial_loss(real_output, real_labels)
+                    d_loss_fake = adversarial_loss(fake_output, fake_labels)
 
-                        d_loss_real = adversarial_loss(real_output, real_labels)
-                        d_loss_fake = adversarial_loss(fake_output, fake_labels)
-                        d_loss = (d_loss_real + d_loss_fake) / 2
-                    else:
-                        real_fake_age_output = discriminator(
-                            real_imgs, new_age_vecs, asd_vecs
-                        )
-                        fake_imgs = generator(
-                            real_imgs, shifted_age_vecs, asd_vecs
-                        ).detach()
-                        fake_output = discriminator(fake_imgs, new_age_vecs, asd_vecs)
-                        d_loss_real_fake_age = adversarial_loss(
-                            real_fake_age_output, fake_labels
-                        )
-                        d_loss_fake = adversarial_loss(fake_output, fake_labels)
-                        d_loss = (d_loss_real_fake_age + d_loss_fake) / 2
+                    true_ages = torch.tensor(
+                        [real_age_vecs[i].sum().item() for i in range(batch_size)],
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                    fake_ages = torch.tensor(
+                        [new_age_vecs[i].sum().item() for i in range(batch_size)],
+                        dtype=torch.float32,
+                        device=device,
+                    )
+                    age_loss = F.mse_loss(age_output.squeeze(), true_ages / 20.0)
+                    age_loss_1 = F.mse_loss(
+                        real_fake_age_output.squeeze(), fake_ages / 20.0
+                    )
+
+                    d_loss = (d_loss_real + d_loss_fake) / 2 + (age_loss + age_loss_1)
 
                 current_d_loss = d_loss.item()
                 if current_d_loss > d_loss_threshold:
@@ -448,12 +450,9 @@ def train_gan(
                 with torch.cuda.amp.autocast():
                     # Generate NEW fake images using SHIFTED ages for generator training
                     fake_imgs_gen = generator(real_imgs, shifted_age_vecs, asd_vecs)
-
-                    # Adversarial loss - discriminator evaluates against REAL ages
                     fake_output_gen = discriminator(
                         fake_imgs_gen, new_age_vecs, asd_vecs
                     )
-
                     g_loss_adv = adversarial_loss(fake_output_gen, real_labels)
 
                     # Hybrid content loss for sharper images
@@ -486,13 +485,9 @@ def train_gan(
                         fake_imgs_gen, new_age_vecs, asd_vecs
                     )
                     g_loss_adv = adversarial_loss(fake_output_gen, real_labels)
-                    # Hybrid content loss for sharper images
                     g_loss_l1 = F.l1_loss(fake_imgs_gen, real_imgs)
                     g_loss_l2 = F.mse_loss(fake_imgs_gen, real_imgs)
-                    g_loss_content = (
-                        0.8 * g_loss_l1 + 0.2 * g_loss_l2
-                    )  # Weighted combination
-
+                    g_loss_content = 0.8 * g_loss_l1 + 0.2 * g_loss_l2
                     current_g_loss = (
                         adversarial_weight * g_loss_adv
                         + content_weight * g_loss_content
@@ -510,15 +505,11 @@ def train_gan(
                 print("Stopping training to prevent further instability.")
                 break
 
-            # Store losses
             g_losses.append(current_g_loss)
             d_losses.append(current_d_loss)
             content_losses.append(current_content_loss)
-
-            # Calculate loss ratio for monitoring only
             loss_ratio = current_d_loss / max(current_g_loss, 0.001)
 
-            # Debug print every 50 batches to monitor discriminator
             if batch_idx % 50 == 0:
                 if not use_wgan_gp:
                     real_pred_mean = torch.sigmoid(real_output).mean().item()
@@ -1033,7 +1024,6 @@ def main(hparams):
         num_workers=8,
         pin_memory=True,
     )
-
     # val_loader = DataLoader(
     #     val_dataset,
     #     batch_size=batch_size,
@@ -1041,7 +1031,6 @@ def main(hparams):
     #     num_workers=8,
     #     pin_memory=True,
     # )
-
     test_loader = DataLoader(
         test_dataset,
         batch_size=batch_size,
@@ -1069,7 +1058,6 @@ def main(hparams):
     discriminator = create_discriminator(
         input_shape=(1, 192, 192),
         filters=filters,
-        age_dim=20,
         ASD_dim=1,
     ).to(device)
 

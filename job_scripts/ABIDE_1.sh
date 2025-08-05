@@ -15,11 +15,16 @@ source /projectnb/ace-genetics/jueqiw/software/venvs/monai/bin/activate
 cd /project/ace-genetics/jueqiw/code/Autism_Brain_Development/code/project/
 
 python 2D_MRI_GAN.py \
-    --experiment_name "gan_new_only_increase_age_per_0.3_d_1_deeper_discr" \
-    --n_epoch 500 \
+    --experiment_name "gan_d_1_lr_1e-3_gr_2e-4_bs_32_content_1_adver_10.0_patch_GAN_without_scheduler" \
+    --n_epoch 900 \
     --batch_size 32 \
     --perceptual_weight 0.3 \
-    --d_train_freq 1
+    --d_train_freq 1 \
+    --content_weight 1.0 \
+    --lr_discriminator 1e-4 \
+    --lr_generator 2e-4 \
+    --adversarial_weight 10.0
+
 
 python 2D_MRI_VAE_regression.py \
     --recon_weight 10.0 \

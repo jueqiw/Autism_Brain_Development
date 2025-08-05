@@ -344,8 +344,3 @@ def add_argument(parser: ArgumentParser):
         type=int,
         help="Frequency for training generator (1=every iteration, 2=every 2nd iteration)",
     )
-    parser.add_argument(
-        "--model_prefix",
-        default="gan",
-        type=str,
-    )
