@@ -14,6 +14,8 @@ source /projectnb/ace-genetics/jueqiw/software/venvs/monai/bin/activate
 
 cd /project/ace-genetics/jueqiw/code/Autism_Brain_Development/code/project/
 
+python test_2D_MRI_GAN.py
+
 python 2D_MRI_GAN.py \
     --experiment_name "gan_d_1_lr_1e-3_gr_2e-4_bs_32_content_1_adver_10.0_patch_GAN_without_scheduler" \
     --n_epoch 900 \
